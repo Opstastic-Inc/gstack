@@ -152,6 +152,10 @@ function createLinuxFixtureDb() {
   // A row whose first 32 bytes hash ANOTHER host: corrupt in a meta 24+ database (Chromium: kHashFailed).
   insert.run('.linux-foreign.com', 'foreign', '', encryptCookieValue('foreign-value', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-foreign.com', hashOf: '.some-other-host.com' }), '/', futureExpiry, 1, 1, 1, 1);
   insert.run('.linux-plain.com', 'plain', 'plain-linux', Buffer.alloc(0), '/', futureExpiry, 0, 0, 1, 1);
+  // Meta 24: a plaintext shorter than 32 bytes cannot carry the hash, so the row is corrupt.
+  insert.run('.linux-short.com', 'tiny', '', encryptCookieValue('tiny', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-short.com', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
+  // Meta 24: an empty value is the hash alone, and imports as ''.
+  insert.run('.linux-empty.com', 'empty', '', encryptCookieValue('', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-empty.com' }), '/', futureExpiry, 1, 1, 1, 1);
 
   db.close();
 }
@@ -180,6 +184,8 @@ function createLinuxLegacyFixtureDb() {
 let findInstalledBrowsers: any;
 let listDomains: any;
 let importCookies: any;
+let stripHostKeyPrefix: any;
+let readCookieDbMetaVersion: any;
 let CookieImportError: any;
 let originalSpawn: typeof Bun.spawn;
 
@@ -233,6 +239,8 @@ beforeAll(async () => {
   findInstalledBrowsers = mod.findInstalledBrowsers;
   listDomains = mod.listDomains;
   importCookies = mod.importCookies;
+  stripHostKeyPrefix = mod.stripHostKeyPrefix;
+  readCookieDbMetaVersion = mod.readCookieDbMetaVersion;
   CookieImportError = mod.CookieImportError;
 });
 
@@ -517,6 +525,57 @@ describe('Cookie Import Browser', () => {
         expect(result.failed).toBe(1);
         expect(result.failureReasons).toEqual({ decryption_failed: 1 });
       }, 'GstackLinuxForeign');
+    });
+
+    test('fails a meta 24+ plaintext shorter than 32 bytes, and imports an empty value as ""', async () => {
+      await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
+        const short = await importCookies('chromium', ['.linux-short.com'], 'GstackLinuxShort');
+        expect(short.count).toBe(0);
+        expect(short.failureReasons).toEqual({ decryption_failed: 1 });
+
+        const empty = await importCookies('chromium', ['.linux-empty.com'], 'GstackLinuxShort');
+        expect(empty.failed).toBe(0);
+        expect(empty.cookies[0].value).toBe('');
+      }, 'GstackLinuxShort');
+    });
+  });
+
+  describe('Host-key prefix rule (every platform: the GCM and CBC branches share it)', () => {
+    const host = '.rule.test';
+    const hash = crypto.createHash('sha256').update(host).digest();
+    const value = Buffer.from('rule-value');
+
+    test('meta 24+: strips a matching hash, throws on a mismatch or a short plaintext', () => {
+      expect(stripHostKeyPrefix(Buffer.concat([hash, value]), host, 24).toString()).toBe('rule-value');
+      const foreign = crypto.createHash('sha256').update('.other.test').digest();
+      expect(() => stripHostKeyPrefix(Buffer.concat([foreign, value]), host, 24)).toThrow();
+      expect(() => stripHostKeyPrefix(Buffer.from('short'), host, 25)).toThrow();
+    });
+
+    test('below meta 24: never strips, even bytes that equal the hash', () => {
+      const legacy = Buffer.concat([hash, value]);
+      expect(stripHostKeyPrefix(legacy, host, 23).equals(legacy)).toBe(true);
+    });
+
+    test('no meta row: strips only a matching hash, keeps anything else whole', () => {
+      expect(stripHostKeyPrefix(Buffer.concat([hash, value]), host, null).toString()).toBe('rule-value');
+      expect(stripHostKeyPrefix(value, host, null).toString()).toBe('rule-value');
+    });
+
+    test('reads meta.version, and a NULL, empty or missing value as unreadable (null), never as 0', () => {
+      const versionOf = (stored: string | null | undefined) => {
+        const db = new Database(':memory:');
+        db.run(`CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)`);
+        if (stored !== undefined) db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [stored]);
+        try { return readCookieDbMetaVersion(db); } finally { db.close(); }
+      };
+      expect(versionOf('24')).toBe(24);
+      expect(versionOf('23')).toBe(23);
+      expect(versionOf(null)).toBeNull();
+      expect(versionOf('')).toBeNull();
+      expect(versionOf(undefined)).toBeNull();
+      const noMeta = new Database(':memory:');
+      try { expect(readCookieDbMetaVersion(noMeta)).toBeNull(); } finally { noMeta.close(); }
     });
 
     test('lists domains from Linux Chromium profiles', async () => {

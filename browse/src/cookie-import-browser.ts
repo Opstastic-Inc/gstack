@@ -862,11 +862,17 @@ function decryptCookieValue(
 /** The first cookie DB meta version that prefixes each value with SHA-256(host_key). */
 const HOST_KEY_PREFIX_META_VERSION = 24;
 
-/** The cookie DB's `meta.version`, or null when the database has no readable meta row. */
-function readCookieDbMetaVersion(db: ReturnType<typeof openCookieDatabase>): number | null {
+/**
+ * The cookie DB's `meta.version`, or null when the database has no readable meta row.
+ * A NULL or empty value is unreadable, not version 0 (`Number('')` is 0): reading it as 0
+ * would turn the prefix strip off for every row of a damaged database.
+ */
+export function readCookieDbMetaVersion(db: Pick<ReturnType<typeof openCookieDatabase>, 'query'>): number | null {
   try {
-    const [row] = db.query(`SELECT value FROM meta WHERE key = 'version'`).all() as Array<{ value: string | number }>;
-    const version = row === undefined ? Number.NaN : Number(row.value);
+    const [row] = db.query(`SELECT value FROM meta WHERE key = 'version'`).all() as Array<{ value: string | number | null }>;
+    const raw = row?.value;
+    if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+    const version = Number(raw);
     return Number.isInteger(version) ? version : null;
   } catch {
     return null;
@@ -882,7 +888,7 @@ function readCookieDbMetaVersion(db: ReturnType<typeof openCookieDatabase>): num
  *   - meta version below 24: there is no prefix; every byte is the value.
  *   - no meta row: strip only when the first 32 bytes are this row's hash.
  */
-function stripHostKeyPrefix(plaintext: Buffer, hostKey: string, metaVersion: number | null): Buffer {
+export function stripHostKeyPrefix(plaintext: Buffer, hostKey: string, metaVersion: number | null): Buffer {
   if (metaVersion !== null && metaVersion < HOST_KEY_PREFIX_META_VERSION) return plaintext;
   const hostHash = crypto.createHash('sha256').update(hostKey).digest();
   const prefixed = plaintext.length >= 32 && plaintext.subarray(0, 32).equals(hostHash);
