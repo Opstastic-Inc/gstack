@@ -146,6 +146,11 @@ describe('actual Node importer runtime', () => {
     database.run('CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, has_expires INTEGER, samesite INTEGER)');
     database.run('INSERT INTO cookies VALUES (?, ?, ?, ?, ?, 0, 1, 1, 0, 1)', ['.dpapi.fixture', 'session', '', seal(key, Buffer.concat([hostHash, Buffer.from(expected)])), '/']);
     database.run('INSERT INTO cookies VALUES (?, ?, ?, ?, ?, 0, 1, 1, 0, 1)', ['.dpapi.fixture', 'wrong-key', '', seal(randomBytes(32), Buffer.concat([hostHash, Buffer.from('other')])), '/']);
+    // Meta version 24: the GCM branch must also fail a row whose prefix hashes another host (Chromium: kHashFailed).
+    database.run('CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)');
+    database.run("INSERT INTO meta VALUES ('version', '24')");
+    const foreignHash = createHash('sha256').update('.other.fixture').digest();
+    database.run('INSERT INTO cookies VALUES (?, ?, ?, ?, ?, 0, 1, 1, 0, 1)', ['.dpapi.fixture', 'foreign-prefix', '', seal(key, Buffer.concat([foreignHash, Buffer.from('other')])), '/']);
     database.close();
 
     const child = spawnSync(node!, ['--input-type=module', '-e', `
@@ -164,7 +169,7 @@ describe('actual Node importer runtime', () => {
     expect(child.error).toBeUndefined();
     expect(child.stderr).toBe('');
     expect(child.status).toBe(0);
-    expect(JSON.parse(child.stdout)).toEqual({ count: 1, failed: 1, reasons: { decryption_failed: 1 }, matches: true });
+    expect(JSON.parse(child.stdout)).toEqual({ count: 1, failed: 2, reasons: { decryption_failed: 2 }, matches: true });
     expect(child.stdout).not.toContain(expected);
     expect(child.stdout).not.toContain(key.toString('base64'));
   }, 90_000);
