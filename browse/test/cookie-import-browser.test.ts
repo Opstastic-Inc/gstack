@@ -44,20 +44,22 @@ const CHROMIUM_EPOCH_OFFSET = 11644473600000000n;
 const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-cookie-fixtures-'));
 const FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies.db');
 const LINUX_FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies-linux.db');
+const LINUX_LEGACY_FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies-linux-legacy.db');
 
 // ─── Encryption Helper ──────────────────────────────────────────
 
 function encryptCookieValue(
   value: string,
-  options?: { key?: Buffer; prefix?: 'v10' | 'v11'; host?: string; legacy?: boolean; hashOf?: string },
+  // `host` is the row's host_key and is required: a row of a meta 24+ database carries ITS OWN hash.
+  options: { host: string; key?: Buffer; prefix?: 'v10' | 'v11'; legacy?: boolean; hashOf?: string },
 ): Buffer {
-  const key = options?.key ?? TEST_KEY;
-  const prefix = options?.prefix ?? 'v10';
+  const key = options.key ?? TEST_KEY;
+  const prefix = options.prefix ?? 'v10';
   // Meta version 24+: SHA-256(host_key) + actual value. A legacy (pre-24) row has no prefix.
-  // `hashOf` writes the hash of a DIFFERENT host, to prove a foreign prefix is kept.
-  const hostHash = crypto.createHash('sha256').update(options?.hashOf ?? options?.host ?? '').digest();
+  // `hashOf` writes the hash of a DIFFERENT host: a corrupt row that Chromium does not load.
+  const hostHash = crypto.createHash('sha256').update(options.hashOf ?? options.host).digest();
   const body = Buffer.from(value, 'utf-8');
-  const plaintext = options?.legacy ? body : Buffer.concat([hostHash, body]);
+  const plaintext = options.legacy ? body : Buffer.concat([hostHash, body]);
 
   // PKCS7 pad to AES block size (16 bytes)
   const blockSize = 16;
@@ -77,11 +79,14 @@ function chromiumEpoch(unixSeconds: number): bigint {
 
 // ─── Create Fixture Database ────────────────────────────────────
 
-function createFixtureDb(dbPath: string): Database {
+/** Chromium's meta table: `version` 24+ means every encrypted value starts with SHA-256(host_key). */
+function createFixtureDb(dbPath: string, metaVersion = 24): Database {
   fs.mkdirSync(FIXTURE_DIR, { recursive: true });
   if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
 
   const db = new Database(dbPath);
+  db.run(`CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)`);
+  db.run(`INSERT INTO meta (key, value) VALUES ('version', ?)`, [String(metaVersion)]);
   db.run(`CREATE TABLE cookies (
     host_key TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -107,28 +112,28 @@ function createMacFixtureDb() {
   const pastExpiry = Number(chromiumEpoch(Math.floor(Date.now() / 1000) - 86400));
 
   // Domain 1: .github.com — 3 encrypted cookies
-  insert.run('.github.com', 'session_id', '', encryptCookieValue('abc123'), '/', futureExpiry, 1, 1, 1, 1);
-  insert.run('.github.com', 'user_token', '', encryptCookieValue('token-xyz'), '/', futureExpiry, 1, 0, 1, 0);
-  insert.run('.github.com', 'theme', '', encryptCookieValue('dark'), '/', futureExpiry, 0, 0, 1, 2);
+  insert.run('.github.com', 'session_id', '', encryptCookieValue('abc123', { host: '.github.com' }), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.github.com', 'user_token', '', encryptCookieValue('token-xyz', { host: '.github.com' }), '/', futureExpiry, 1, 0, 1, 0);
+  insert.run('.github.com', 'theme', '', encryptCookieValue('dark', { host: '.github.com' }), '/', futureExpiry, 0, 0, 1, 2);
 
   // Domain 2: .google.com — 2 cookies
-  insert.run('.google.com', 'NID', '', encryptCookieValue('google-nid-value'), '/', futureExpiry, 1, 1, 1, 0);
-  insert.run('.google.com', 'SID', '', encryptCookieValue('google-sid-value'), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.google.com', 'NID', '', encryptCookieValue('google-nid-value', { host: '.google.com' }), '/', futureExpiry, 1, 1, 1, 0);
+  insert.run('.google.com', 'SID', '', encryptCookieValue('google-sid-value', { host: '.google.com' }), '/', futureExpiry, 1, 1, 1, 1);
 
   // Domain 3: .example.com — 1 unencrypted cookie (value field set, no encrypted_value)
   insert.run('.example.com', 'plain_cookie', 'hello-world', Buffer.alloc(0), '/', futureExpiry, 0, 0, 1, 1);
 
   // Domain 4: .expired.com — 1 expired cookie (should be filtered out)
-  insert.run('.expired.com', 'old', '', encryptCookieValue('expired-value'), '/', pastExpiry, 0, 0, 1, 1);
+  insert.run('.expired.com', 'old', '', encryptCookieValue('expired-value', { host: '.expired.com' }), '/', pastExpiry, 0, 0, 1, 1);
 
   // Domain 5: .session.com — session cookie (has_expires=0)
-  insert.run('.session.com', 'sess', '', encryptCookieValue('session-value'), '/', 0, 1, 1, 0, 1);
+  insert.run('.session.com', 'sess', '', encryptCookieValue('session-value', { host: '.session.com' }), '/', 0, 1, 1, 0, 1);
 
   // Domain 6: .corrupt.com — cookie with garbage encrypted_value
   insert.run('.corrupt.com', 'bad', '', Buffer.from('v10' + 'not-valid-ciphertext-at-all'), '/', futureExpiry, 0, 0, 1, 1);
 
   // Domain 7: .mixed.com — one good, one corrupt
-  insert.run('.mixed.com', 'good', '', encryptCookieValue('mixed-good'), '/', futureExpiry, 0, 0, 1, 1);
+  insert.run('.mixed.com', 'good', '', encryptCookieValue('mixed-good', { host: '.mixed.com' }), '/', futureExpiry, 0, 0, 1, 1);
   insert.run('.mixed.com', 'bad', '', Buffer.from('v10' + 'garbage-data-here!!!'), '/', futureExpiry, 0, 0, 1, 1);
 
   db.close();
@@ -144,12 +149,24 @@ function createLinuxFixtureDb() {
 
   insert.run('.linux-v10.com', 'sid', '', encryptCookieValue('linux-v10-value', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-v10.com' }), '/', futureExpiry, 1, 1, 1, 1);
   insert.run('.linux-v11.com', 'auth', '', encryptCookieValue('linux-v11-value', { key: LINUX_V11_KEY, prefix: 'v11', host: '.linux-v11.com' }), '/', futureExpiry, 1, 1, 1, 1);
-  // Legacy rows (cookie DB meta version below 24): no SHA-256(host_key) prefix.
-  insert.run('.linux-legacy.com', 'long', '', encryptCookieValue(LEGACY_LONG_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
-  insert.run('.linux-legacy.com', 'short', '', encryptCookieValue(LEGACY_SHORT_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
-  // A row whose first 32 bytes hash ANOTHER host: not this row's prefix, so nothing is stripped.
+  // A row whose first 32 bytes hash ANOTHER host: corrupt in a meta 24+ database (Chromium: kHashFailed).
   insert.run('.linux-foreign.com', 'foreign', '', encryptCookieValue('foreign-value', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-foreign.com', hashOf: '.some-other-host.com' }), '/', futureExpiry, 1, 1, 1, 1);
   insert.run('.linux-plain.com', 'plain', 'plain-linux', Buffer.alloc(0), '/', futureExpiry, 0, 0, 1, 1);
+
+  db.close();
+}
+
+/** A database Chromium has not migrated to meta version 24: no value carries a prefix. */
+function createLinuxLegacyFixtureDb() {
+  const db = createFixtureDb(LINUX_LEGACY_FIXTURE_DB, 23);
+  const insert = db.prepare(`INSERT INTO cookies
+    (host_key, name, value, encrypted_value, path, expires_utc, is_secure, is_httponly, has_expires, samesite)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+
+  const futureExpiry = Number(chromiumEpoch(Math.floor(Date.now() / 1000) + 86400 * 365));
+
+  insert.run('.linux-legacy.com', 'long', '', encryptCookieValue(LEGACY_LONG_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-legacy.com', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.linux-legacy.com', 'short', '', encryptCookieValue(LEGACY_SHORT_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-legacy.com', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
 
   db.close();
 }
@@ -169,6 +186,7 @@ let originalSpawn: typeof Bun.spawn;
 beforeAll(async () => {
   createMacFixtureDb();
   createLinuxFixtureDb();
+  createLinuxLegacyFixtureDb();
 
   // Mock Bun.spawn to return test password for keychain access
   originalSpawn = Bun.spawn;
@@ -225,6 +243,7 @@ afterAll(() => {
   // Clean up fixture DB
   try { fs.unlinkSync(FIXTURE_DB); } catch {}
   try { fs.unlinkSync(LINUX_FIXTURE_DB); } catch {}
+  try { fs.unlinkSync(LINUX_LEGACY_FIXTURE_DB); } catch {}
   try { fs.rmdirSync(FIXTURE_DIR); } catch {}
 });
 
@@ -276,7 +295,7 @@ describe('Cookie Import Browser', () => {
   describe('Decryption Pipeline', () => {
     test('encrypts and decrypts round-trip correctly', () => {
       // Verify our test helper produces valid ciphertext
-      const encrypted = encryptCookieValue('hello-world');
+      const encrypted = encryptCookieValue('hello-world', { host: '.example.com' });
       expect(encrypted.slice(0, 3).toString()).toBe('v10');
 
       // Decrypt manually to verify
@@ -289,7 +308,7 @@ describe('Cookie Import Browser', () => {
     });
 
     test('handles empty encrypted_value', () => {
-      const encrypted = encryptCookieValue('');
+      const encrypted = encryptCookieValue('', { host: '.example.com' });
       const ciphertext = encrypted.slice(3);
       const decipher = crypto.createDecipheriv('aes-128-cbc', TEST_KEY, IV);
       const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
@@ -300,7 +319,7 @@ describe('Cookie Import Browser', () => {
 
     test('handles special characters in cookie values', () => {
       const specialValue = 'a=b&c=d; path=/; expires=Thu, 01 Jan 2099';
-      const encrypted = encryptCookieValue(specialValue);
+      const encrypted = encryptCookieValue(specialValue, { host: '.example.com' });
       const ciphertext = encrypted.slice(3);
       const decipher = crypto.createDecipheriv('aes-128-cbc', TEST_KEY, IV);
       const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
@@ -479,7 +498,7 @@ describe('Cookie Import Browser', () => {
     });
 
     test('imports a legacy (pre-meta-24) cookie with no prefix whole', async () => {
-      await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
+      await withInstalledProfile('.config/chromium', LINUX_LEGACY_FIXTURE_DB, async () => {
         const result = await importCookies('chromium', ['.linux-legacy.com'], 'GstackLinuxLegacy');
         const byName = Object.fromEntries(result.cookies.map((cookie: any) => [cookie.name, cookie.value]));
 
@@ -489,14 +508,14 @@ describe('Cookie Import Browser', () => {
       }, 'GstackLinuxLegacy');
     });
 
-    test('keeps a value whose first 32 bytes hash another host', async () => {
+    test('fails a meta 24+ row whose first 32 bytes hash another host, as Chromium does (kHashFailed)', async () => {
       await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
         const result = await importCookies('chromium', ['.linux-foreign.com'], 'GstackLinuxForeign');
 
-        expect(result.count).toBe(1);
-        // Not this row's SHA-256(host_key), so the 32 bytes are value bytes and stay.
-        expect(result.cookies[0].value.length).toBeGreaterThan('foreign-value'.length);
-        expect(result.cookies[0].value.endsWith('foreign-value')).toBe(true);
+        // Never imported with 32 garbage bytes in front of the value: the row is reported as failed.
+        expect(result.count).toBe(0);
+        expect(result.failed).toBe(1);
+        expect(result.failureReasons).toEqual({ decryption_failed: 1 });
       }, 'GstackLinuxForeign');
     });
 
