@@ -9,8 +9,9 @@
  *   key = PBKDF2(password, "saltysalt", 1003, 16, sha1)
  *
  * Encryption: AES-128-CBC with IV = 16 × 0x20, prefix "v10"
- * First 32 bytes of plaintext = HMAC-SHA256 tag (random for tests)
- * Remaining bytes = actual cookie value
+ * Cookie DB meta version 24+: first 32 bytes of plaintext = SHA-256(host_key),
+ * remaining bytes = actual cookie value. Older databases (legacy rows) have no
+ * prefix: the whole plaintext is the value.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -29,6 +30,10 @@ const LINUX_V10_KEY = crypto.pbkdf2Sync(LINUX_V10_PASSWORD, 'saltysalt', 1, 16, 
 const LINUX_V11_PASSWORD = 'test-linux-secret';
 const LINUX_V11_KEY = crypto.pbkdf2Sync(LINUX_V11_PASSWORD, 'saltysalt', 1, 16, 'sha1');
 const IV = Buffer.alloc(16, 0x20);
+// Longer than 32 bytes: today's CBC path would cut its first 32 bytes.
+const LEGACY_LONG_VALUE = 'legacy-session-0123456789abcdefghijklmnopqrstuvwxyz';
+// 32 bytes or less: today's CBC path would return ''.
+const LEGACY_SHORT_VALUE = 'short-legacy';
 const CHROMIUM_EPOCH_OFFSET = 11644473600000000n;
 
 // Fixture DB path — a per-run temp dir, NEVER the tracked browse/test/fixtures/:
@@ -44,13 +49,15 @@ const LINUX_FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies-linux.db');
 
 function encryptCookieValue(
   value: string,
-  options?: { key?: Buffer; prefix?: 'v10' | 'v11' },
+  options?: { key?: Buffer; prefix?: 'v10' | 'v11'; host?: string; legacy?: boolean; hashOf?: string },
 ): Buffer {
   const key = options?.key ?? TEST_KEY;
   const prefix = options?.prefix ?? 'v10';
-  // 32-byte HMAC tag (random for test) + actual value
-  const hmacTag = crypto.randomBytes(32);
-  const plaintext = Buffer.concat([hmacTag, Buffer.from(value, 'utf-8')]);
+  // Meta version 24+: SHA-256(host_key) + actual value. A legacy (pre-24) row has no prefix.
+  // `hashOf` writes the hash of a DIFFERENT host, to prove a foreign prefix is kept.
+  const hostHash = crypto.createHash('sha256').update(options?.hashOf ?? options?.host ?? '').digest();
+  const body = Buffer.from(value, 'utf-8');
+  const plaintext = options?.legacy ? body : Buffer.concat([hostHash, body]);
 
   // PKCS7 pad to AES block size (16 bytes)
   const blockSize = 16;
@@ -135,8 +142,13 @@ function createLinuxFixtureDb() {
 
   const futureExpiry = Number(chromiumEpoch(Math.floor(Date.now() / 1000) + 86400 * 365));
 
-  insert.run('.linux-v10.com', 'sid', '', encryptCookieValue('linux-v10-value', { key: LINUX_V10_KEY, prefix: 'v10' }), '/', futureExpiry, 1, 1, 1, 1);
-  insert.run('.linux-v11.com', 'auth', '', encryptCookieValue('linux-v11-value', { key: LINUX_V11_KEY, prefix: 'v11' }), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.linux-v10.com', 'sid', '', encryptCookieValue('linux-v10-value', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-v10.com' }), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.linux-v11.com', 'auth', '', encryptCookieValue('linux-v11-value', { key: LINUX_V11_KEY, prefix: 'v11', host: '.linux-v11.com' }), '/', futureExpiry, 1, 1, 1, 1);
+  // Legacy rows (cookie DB meta version below 24): no SHA-256(host_key) prefix.
+  insert.run('.linux-legacy.com', 'long', '', encryptCookieValue(LEGACY_LONG_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
+  insert.run('.linux-legacy.com', 'short', '', encryptCookieValue(LEGACY_SHORT_VALUE, { key: LINUX_V10_KEY, prefix: 'v10', legacy: true }), '/', futureExpiry, 1, 1, 1, 1);
+  // A row whose first 32 bytes hash ANOTHER host: not this row's prefix, so nothing is stripped.
+  insert.run('.linux-foreign.com', 'foreign', '', encryptCookieValue('foreign-value', { key: LINUX_V10_KEY, prefix: 'v10', host: '.linux-foreign.com', hashOf: '.some-other-host.com' }), '/', futureExpiry, 1, 1, 1, 1);
   insert.run('.linux-plain.com', 'plain', 'plain-linux', Buffer.alloc(0), '/', futureExpiry, 0, 0, 1, 1);
 
   db.close();
@@ -271,7 +283,7 @@ describe('Cookie Import Browser', () => {
       const ciphertext = encrypted.slice(3);
       const decipher = crypto.createDecipheriv('aes-128-cbc', TEST_KEY, IV);
       const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-      // Skip 32-byte HMAC tag
+      // Skip the 32-byte SHA-256(host_key) prefix
       const value = plaintext.slice(32).toString('utf-8');
       expect(value).toBe('hello-world');
     });
@@ -464,6 +476,28 @@ describe('Cookie Import Browser', () => {
         expect(result.cookies[0].name).toBe('auth');
         expect(result.cookies[0].value).toBe('linux-v11-value');
       }, 'GstackLinuxV11');
+    });
+
+    test('imports a legacy (pre-meta-24) cookie with no prefix whole', async () => {
+      await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
+        const result = await importCookies('chromium', ['.linux-legacy.com'], 'GstackLinuxLegacy');
+        const byName = Object.fromEntries(result.cookies.map((cookie: any) => [cookie.name, cookie.value]));
+
+        expect(result.failed).toBe(0);
+        expect(byName.long).toBe(LEGACY_LONG_VALUE);
+        expect(byName.short).toBe(LEGACY_SHORT_VALUE);
+      }, 'GstackLinuxLegacy');
+    });
+
+    test('keeps a value whose first 32 bytes hash another host', async () => {
+      await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
+        const result = await importCookies('chromium', ['.linux-foreign.com'], 'GstackLinuxForeign');
+
+        expect(result.count).toBe(1);
+        // Not this row's SHA-256(host_key), so the 32 bytes are value bytes and stay.
+        expect(result.cookies[0].value.length).toBeGreaterThan('foreign-value'.length);
+        expect(result.cookies[0].value.endsWith('foreign-value')).toBe(true);
+      }, 'GstackLinuxForeign');
     });
 
     test('lists domains from Linux Chromium profiles', async () => {

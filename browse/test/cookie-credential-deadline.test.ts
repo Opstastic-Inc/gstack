@@ -28,7 +28,9 @@ function fixture(encrypted: Buffer, hostPlatform: 'darwin' | 'linux' | 'win32' =
 function cbcCookie(password: string, prefix = 'v10') {
   const key = crypto.pbkdf2Sync(password, 'saltysalt', prefix === 'v11' ? 1 : 1003, 16, 'sha1');
   const cipher = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
-  return Buffer.concat([Buffer.from(prefix), cipher.update(Buffer.concat([Buffer.alloc(32), Buffer.from('fixture-value')])), cipher.final()]);
+  // Cookie DB meta version 24+: the value follows SHA-256(host_key) of the fixture row.
+  const hostHash = crypto.createHash('sha256').update('.fixture.test').digest();
+  return Buffer.concat([Buffer.from(prefix), cipher.update(Buffer.concat([hostHash, Buffer.from('fixture-value')])), cipher.final()]);
 }
 
 function pipe(content?: string): { stream: ReadableStream<Uint8Array>; close(): void; cancelled(): boolean } {

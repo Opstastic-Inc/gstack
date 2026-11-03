@@ -26,7 +26,7 @@
  *   │    - IV = 16 bytes of 0x20 (space character)                    │
  *   │    - Plaintext = AES-128-CBC-decrypt(key, iv, ciphertext)       │
  *   │    - Remove PKCS7 padding                                       │
- *   │    - Skip first 32 bytes of Chromium cookie metadata            │
+ *   │    - Drop a leading SHA-256(host_key) when present (meta v24+)  │
  *   │    - Remaining bytes = cookie value (UTF-8)                     │
  *   │    Windows v10: AES-256-GCM(nonce=ev[3:15], tag=last 16 bytes); │
  *   │    drop a leading SHA-256(host_key) when present (DB meta v24+) │
@@ -842,10 +842,7 @@ function decryptCookieValue(row: RawCookie, keys: Map<string, Buffer>, platform:
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce) as crypto.DecipherGCM;
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    // Cookie DB meta version 24+ prefixes the value with SHA-256(host_key).
-    const hostHash = crypto.createHash('sha256').update(row.host_key).digest();
-    const prefixed = plaintext.length >= 32 && plaintext.subarray(0, 32).equals(hostHash);
-    return (prefixed ? plaintext.subarray(32) : plaintext).toString('utf-8');
+    return stripHostKeyPrefix(plaintext, row.host_key).toString('utf-8');
   }
 
   // macOS / Linux: AES-128-CBC — structure: v10/v11(3) + ciphertext
@@ -853,10 +850,18 @@ function decryptCookieValue(row: RawCookie, keys: Map<string, Buffer>, platform:
   const iv = Buffer.alloc(16, 0x20); // 16 space characters
   const decipher = crypto.createDecipheriv('aes-128-cbc', key, iv);
   const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return stripHostKeyPrefix(plaintext, row.host_key).toString('utf-8');
+}
 
-  // Chromium prefixes encrypted cookie payloads with 32 bytes of metadata.
-  if (plaintext.length <= 32) return '';
-  return plaintext.slice(32).toString('utf-8');
+/**
+ * Cookie DB meta version 24+ prefixes each decrypted value with SHA-256(host_key).
+ * An older database has no prefix, so the 32 bytes are part of the value: strip
+ * them only when they are this row's hash (the rule yt-dlp keys on meta.version).
+ */
+function stripHostKeyPrefix(plaintext: Buffer, hostKey: string): Buffer {
+  const hostHash = crypto.createHash('sha256').update(hostKey).digest();
+  const prefixed = plaintext.length >= 32 && plaintext.subarray(0, 32).equals(hostHash);
+  return prefixed ? plaintext.subarray(32) : plaintext;
 }
 
 function toPlaywrightCookie(row: RawCookie, value: string): PlaywrightCookie {
