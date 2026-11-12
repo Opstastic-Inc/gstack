@@ -95,6 +95,28 @@ if grep -qE '\$\{IFS\}|\$IFS|\$\(echo[^)]*base64[^)]*\)|base64[[:space:]]+(-d|--
   exit 0
 fi
 
+# --- git global options ---
+# git accepts global options between `git` and the subcommand (git(1)
+# OPTIONS): `git -C <dir> push --force`, `git -c <k>=<v> reset --hard`. The git
+# patterns in both tiers expect the subcommand right after `git`, so these
+# forms matched nothing and were allowed with no warning. _git_strip_global_opts
+# removes the options, so `git -C app push -f` is checked as `git push -f`. An
+# option argument is one shell word: unquoted characters and "..."/'...' parts.
+_GIT_OPT_ARG="([^[:space:]\"']|\"[^\"]*\"|'[^']*')+"
+_GIT_GLOBAL_OPT="(-C|-c|--git-dir|--work-tree|--namespace|--config-env|--attr-source)([[:space:]]+|=)${_GIT_OPT_ARG}"
+_GIT_GLOBAL_OPT="${_GIT_GLOBAL_OPT}|--(exec-path|list-cmds|super-prefix)(=${_GIT_OPT_ARG})?"
+_GIT_GLOBAL_OPT="${_GIT_GLOBAL_OPT}|-p|-P|--paginate|--no-pager|--bare|--no-replace-objects|--no-lazy-fetch"
+_GIT_GLOBAL_OPT="${_GIT_GLOBAL_OPT}|--no-optional-locks|--no-advice|--(literal|glob|noglob|icase)-pathspecs"
+_GIT_WITH_OPT_RE='git[[:space:]]+-'
+_git_strip_global_opts() {
+  # No subprocess unless some `git` is followed by an option.
+  if [[ $1 =~ $_GIT_WITH_OPT_RE ]]; then
+    printf '%s' "$1" | sed -E "s/(^|[^[:alnum:]_.-])git([[:space:]]+(${_GIT_GLOBAL_OPT}))+[[:space:]]+/\\1git /g"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 # --- HIGH tier: hard deny (best-effort advisory hard-stop, NOT a policy boundary) ---
 # Only SIMPLE commands are eligible: string matching cannot resolve what a
 # compound command does (`cd X && git push --force` — whose cwd? which repo?),
@@ -139,32 +161,59 @@ if [ "$_IS_SIMPLE" -eq 1 ]; then
   # Force-push to the repo's default branch (the shared history everyone pulls).
   # Force is carried by -f/--force OR by git's plus-refspec syntax (+main,
   # +HEAD:main) which needs no flag at all. --force-with-lease never matches.
-  if grep -qE '^[[:space:]]*git[[:space:]]+push([[:space:]]|$)' <<< "$CMD" 2>/dev/null; then
+  _GIT_CMD=$(_git_strip_global_opts "$CMD")
+  if grep -qE '^[[:space:]]*git[[:space:]]+push([[:space:]]|$)' <<< "$_GIT_CMD" 2>/dev/null; then
     _HAS_FORCE=0
-    if grep -qE '(^|[[:space:]])(-f|--force)($|[[:space:]])' <<< "$CMD" 2>/dev/null; then
+    if grep -qE '(^|[[:space:]])(-f|--force)($|[[:space:]])' <<< "$_GIT_CMD" 2>/dev/null; then
       _HAS_FORCE=1
-    elif grep -qE '(^|[[:space:]])\+[^[:space:]]' <<< "$CMD" 2>/dev/null; then
+    elif grep -qE '(^|[[:space:]])\+[^[:space:]]' <<< "$_GIT_CMD" 2>/dev/null; then
       _HAS_FORCE=1
     fi
     if [ "$_HAS_FORCE" -eq 1 ]; then
+      # The default branch belongs to the repo the push runs in, so the lookups
+      # get the push's location options (-C, --git-dir, --work-tree). Never -c:
+      # a config value can name a program for git to run. A path the hook
+      # cannot resolve (a quoted path with spaces, ~, $VAR) finds no default
+      # branch, and the push falls through to the MEDIUM ask.
+      _GIT_LOC=()
+      _NEXT=""
+      set -f
+      for _TOK in $CMD; do
+        _TOK="${_TOK#\"}"; _TOK="${_TOK%\"}"; _TOK="${_TOK#\'}"; _TOK="${_TOK%\'}"
+        case "$_NEXT" in
+          keep) _GIT_LOC+=("$_TOK"); _NEXT=""; continue ;;
+          skip) _NEXT=""; continue ;;
+        esac
+        case "$_TOK" in
+          git) ;;
+          -C|--git-dir|--work-tree) _GIT_LOC+=("$_TOK"); _NEXT=keep ;;
+          --git-dir=*|--work-tree=*) _GIT_LOC+=("$_TOK") ;;
+          -c|--namespace|--config-env|--attr-source) _NEXT=skip ;;
+          -*) ;;
+          *) break ;;
+        esac
+      done
+      set +f
       # Full branch path (slashed defaults like release/2.0 stay intact) and
       # FIXED-STRING token comparison — never interpolate a branch name into
       # an ERE (metacharacters would over/under-match).
-      _DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||' || true)
+      _DEFAULT_BRANCH=$(git ${_GIT_LOC[@]+"${_GIT_LOC[@]}"} symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||' || true)
       # Conductor worktrees often lack the origin/HEAD symbolic ref — without a
       # fallback the HIGH tier would be silently inert in the primary deploy
       # environment. Probe the two conventional defaults.
       if [ -z "$_DEFAULT_BRANCH" ]; then
-        if git show-ref --verify -q refs/remotes/origin/main 2>/dev/null; then
+        if git ${_GIT_LOC[@]+"${_GIT_LOC[@]}"} show-ref --verify -q refs/remotes/origin/main 2>/dev/null; then
           _DEFAULT_BRANCH="main"
-        elif git show-ref --verify -q refs/remotes/origin/master 2>/dev/null; then
+        elif git ${_GIT_LOC[@]+"${_GIT_LOC[@]}"} show-ref --verify -q refs/remotes/origin/master 2>/dev/null; then
           _DEFAULT_BRANCH="master"
         fi
       fi
       if [ -n "$_DEFAULT_BRANCH" ]; then
         _TARGETS_DEFAULT=0
         set -f
-        for _TOK in $CMD; do
+        # Option arguments are gone from _GIT_CMD: `git -C main push -f origin
+        # feature` must not read the directory `main` as the push target.
+        for _TOK in $_GIT_CMD; do
           # Strip one layer of surrounding quotes: `git push -f origin "main"`
           # must not dodge the deny just because the ref is quoted.
           _TOK="${_TOK#\"}"; _TOK="${_TOK%\"}"; _TOK="${_TOK#\'}"; _TOK="${_TOK%\'}"
@@ -177,10 +226,10 @@ if [ "$_IS_SIMPLE" -eq 1 ]; then
           fi
         done
         set +f
-        if [ "$_TARGETS_DEFAULT" -eq 0 ] && grep -qE '^[[:space:]]*git[[:space:]]+push([[:space:]]+(-f|--force))*[[:space:]]*$' <<< "$CMD" 2>/dev/null; then
+        if [ "$_TARGETS_DEFAULT" -eq 0 ] && grep -qE '^[[:space:]]*git[[:space:]]+push([[:space:]]+(-f|--force))*[[:space:]]*$' <<< "$_GIT_CMD" 2>/dev/null; then
           # Bare `git push --force` (force flags only, no remote/ref): targets
           # the current branch's upstream — the default branch only when ON it.
-          _CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+          _CURRENT_BRANCH=$(git ${_GIT_LOC[@]+"${_GIT_LOC[@]}"} branch --show-current 2>/dev/null || true)
           [ -n "$_CURRENT_BRANCH" ] && [ "$_CURRENT_BRANCH" = "$_DEFAULT_BRANCH" ] && _TARGETS_DEFAULT=1
         fi
         if [ "$_TARGETS_DEFAULT" -eq 1 ]; then
@@ -337,21 +386,25 @@ if [ -z "$WARN" ] && grep -qE '\btruncate\b' <<< "$CMD_MEDIUM_LOWER" 2>/dev/null
   PATTERN="truncate"
 fi
 
+# The git families match with git's global options removed (see
+# _git_strip_global_opts): `git -C app reset --hard` is `git reset --hard`.
+CMD_MEDIUM_GIT=$(_git_strip_global_opts "$CMD_MEDIUM")
+
 # git push --force / git push -f / plus-refspec force (git push origin +ref)
-if [ -z "$WARN" ] && grep -qE 'git\s+push\s' <<< "$CMD_MEDIUM" 2>/dev/null \
+if [ -z "$WARN" ] && grep -qE 'git\s+push\s' <<< "$CMD_MEDIUM_GIT" 2>/dev/null \
   && grep -qE '(-f\b|--force|(^|[[:space:]])\+[^[:space:]])' <<< "$CMD_MEDIUM" 2>/dev/null; then
   WARN="Destructive: git force-push rewrites remote history. Other contributors may lose work."
   PATTERN="git_force_push"
 fi
 
 # git reset --hard
-if [ -z "$WARN" ] && grep -qE 'git\s+reset\s+--hard' <<< "$CMD_MEDIUM" 2>/dev/null; then
+if [ -z "$WARN" ] && grep -qE 'git\s+reset\s+--hard' <<< "$CMD_MEDIUM_GIT" 2>/dev/null; then
   WARN="Destructive: git reset --hard discards all uncommitted changes."
   PATTERN="git_reset_hard"
 fi
 
 # git checkout . / git restore .
-if [ -z "$WARN" ] && grep -qE 'git\s+(checkout|restore)\s+\.' <<< "$CMD_MEDIUM" 2>/dev/null; then
+if [ -z "$WARN" ] && grep -qE 'git\s+(checkout|restore)\s+\.' <<< "$CMD_MEDIUM_GIT" 2>/dev/null; then
   WARN="Destructive: discards all uncommitted changes in the working tree."
   PATTERN="git_discard"
 fi

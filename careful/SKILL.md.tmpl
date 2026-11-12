@@ -87,6 +87,11 @@ decision must be nested under `hookSpecificOutput` — Claude Code ignores a
 top-level `permissionDecision`). You can always override a MEDIUM warning and
 proceed.
 
+Git global options before the subcommand (`-C <dir>`, `-c <k>=<v>`,
+`--git-dir`, `--work-tree`, `--no-pager` and the others in git(1)) are skipped,
+so `git -C app push -f` is checked as `git push -f`. For a force-push, the
+default branch is read from the repo that `-C`/`--git-dir`/`--work-tree` name.
+
 ## HIGH tier (hard deny)
 
 Two catastrophic shapes are **denied**, not asked: `rm -r`/`-R` of exactly
