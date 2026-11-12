@@ -1516,7 +1516,9 @@ Bun is missing, `. bin/gstack-bun-version.sh && gstack_bun_install_hint
 `bun-v1.4.2` release archive for this machine (`-baseline` without AVX2,
 `-musl` on musl libc), checks its SHA-256 (the pinned
 `gstack_bun_archive_sha256` on glibc Linux, the release's `SHASUMS256.txt` on
-macOS and musl) and installs it only on a match, then re-run `./setup`.
+macOS and musl) and installs it only on a match and when the unpacked `bun`
+reports that version, then re-run `./setup`. On Alpine, run
+`apk add libstdc++ libgcc` first: without them the musl `bun` does not start.
 
 <a id="doctor-project-pin-mismatch"></a>
 ### `FAIL pins — bun <version> outside engines.bun >=1.4.2 (package.json:<line>; ...) (PROJECT_PIN_MISMATCH; ...)`

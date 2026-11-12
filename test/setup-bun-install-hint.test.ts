@@ -75,12 +75,16 @@ esac
   return { out: r.stdout + r.stderr, installed: fs.existsSync(path.join(home, '.bun', 'bin', 'bun')), urls };
 }
 
-/** A real zip holding bun-<target>/bun, the layout of a Bun release archive. */
-function bunZip(target: string): Buffer {
+/**
+ * A real zip holding bun-<target>/bun, the layout of a Bun release archive.
+ * The fake bun prints the tested version, or runs BODY (a binary that cannot
+ * start on the host: `exit 127`).
+ */
+function bunZip(target: string, body = `echo ${tested}`): Buffer {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-zip-'));
   bases.push(base);
   fs.mkdirSync(path.join(base, `bun-${target}`));
-  fs.writeFileSync(path.join(base, `bun-${target}`, 'bun'), '#!/bin/sh\necho fake-bun\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(base, `bun-${target}`, 'bun'), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   const r = spawnSync('zip', ['-qr', 'bun.zip', `bun-${target}`], { cwd: base, encoding: 'utf8' });
   expect(r.status, r.stderr).toBe(0);
   return fs.readFileSync(path.join(base, 'bun.zip'));
@@ -120,6 +124,27 @@ describe('gstack_bun_install_hint', () => {
     }
   });
 
+  test('gstack_bun_libc: alpine-release, the musl loader or a musl ldd mean musl; otherwise glibc', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-root-'));
+    bases.push(base);
+    const fake = path.join(base, 'fakebin');
+    fs.mkdirSync(fake);
+    fs.writeFileSync(path.join(fake, 'ldd'), '#!/bin/sh\necho "ldd (GNU libc) 2.39"\n', { mode: 0o755 });
+    const libc = (root: string, ldd = true) =>
+      sh(`gstack_bun_libc "${root}"`, { PATH: ldd ? `${fake}:${process.env.PATH}` : (process.env.PATH ?? '') }).stdout.trim();
+    const root = (files: string[]) => {
+      const r = fs.mkdtempSync(path.join(base, 'r-'));
+      for (const f of files) { fs.mkdirSync(path.dirname(path.join(r, f)), { recursive: true }); fs.writeFileSync(path.join(r, f), ''); }
+      return r;
+    };
+    expect(libc(root(['etc/alpine-release']))).toBe('musl');
+    // A musl image with no alpine-release and no working ldd (busybox:musl).
+    expect(libc(root(['lib/ld-musl-aarch64.so.1']))).toBe('musl');
+    expect(libc(root(['lib/ld-musl-x86_64.so.1']), false)).toBe('musl');
+    expect(libc(root(['lib/ld-linux-aarch64.so.1']))).toBe('glibc');
+    expect(libc(root([]))).toBe('glibc');
+  });
+
   test('without a libc argument, an ldd that reports musl selects the -musl archive', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-ldd-'));
     bases.push(base);
@@ -157,6 +182,26 @@ describe('gstack_bun_install_hint', () => {
     expect(r.installed).toBe(false);
   });
 
+  test('musl targets name the Alpine prerequisite above the recipe; glibc and macOS do not', () => {
+    for (const [uname, host] of [['Linux x86_64', { libc: 'musl' }], ['Linux aarch64', { libc: 'musl' }]] as [string, Host][]) {
+      const text = hint(uname, host);
+      expect(text.split('\n')[1]).toBe('On Alpine, first install the libraries Bun needs: apk add libstdc++ libgcc');
+      expect(recipe(text)).not.toContain('apk');
+    }
+    for (const text of [hint('Linux x86_64'), hint('Darwin arm64')]) expect(text).not.toContain('apk');
+  });
+
+  test.skipIf(!hasTools)('a verified archive whose bun does not run, or reports another version, is never installed', () => {
+    for (const body of ['exit 127', 'echo 1.4.1']) {
+      const zip = bunZip('linux-aarch64-musl', body);
+      const r = runRecipe(recipe(hint('Linux aarch64', { libc: 'musl' })), zip, `${sha256(zip)}  bun-linux-aarch64-musl.zip\n`);
+      expect(r.out).toContain('bun-linux-aarch64-musl.zip: OK');
+      expect(r.out).toContain(`the downloaded bun does not report ${tested} on this machine; nothing installed`);
+      expect(r.out).not.toContain('bun installed');
+      expect(r.installed).toBe(false);
+    }
+  });
+
   test.skipIf(!hasTools)('musl recipe: installs the -musl archive on a SHASUMS256.txt match', () => {
     const zip = bunZip('linux-x64-musl-baseline');
     const r = runRecipe(recipe(hint('Linux x86_64', { libc: 'musl', avx2: false })), zip, `${sha256(zip)}  bun-linux-x64-musl-baseline.zip\n`);
@@ -187,7 +232,9 @@ describe('gstack_bun_install_hint', () => {
     bases.push(base);
     const nobun = path.join(base, 'bin');
     fs.mkdirSync(nobun);
-    for (const tool of ['dirname', 'cat', 'uname', 'mkdir']) {
+    // grep and ldd too, so setup and the expected value run the real default
+    // detection (/proc/cpuinfo, the libc) of this machine.
+    for (const tool of ['dirname', 'cat', 'uname', 'mkdir', 'grep', 'ldd']) {
       const found = spawnSync('bash', ['-c', `command -v ${tool}`], { encoding: 'utf-8', timeout: 10_000 }).stdout.trim();
       if (found) fs.symlinkSync(found, path.join(nobun, tool));
     }
