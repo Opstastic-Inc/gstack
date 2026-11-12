@@ -337,7 +337,50 @@ export function projectMarkerRoot(cwd: string): string {
   return root;
 }
 
-function writeCacheEntry(file: string, content: string): void {
+/** gstack-slug's heal-probe sentinel for `cwd`: slug-cache/heal-probed/<per-path key>. */
+function healProbedFile(stateRoot: string, cwd: string): string {
+  return join(stateRoot, "slug-cache", "heal-probed", basename(slugCacheFile(stateRoot, cwd)));
+}
+
+/** The .git dirs the heal probe asks: the repository's common dir, then each level from `cwd` up to `root`. */
+function healProbeGitDirs(cwd: string, root: string): string[] {
+  const dirs = [gitCommonDir(cwd)];
+  let dir = cwd;
+  for (let depth = 0; depth < 64; depth += 1) {
+    dirs.push(join(dir, ".git"));
+    const parent = dirname(dir);
+    if (dir === root || parent === dir) break;
+    dir = parent;
+  }
+  return dirs;
+}
+
+/**
+ * True when a degraded-ancestor probe already cleared this entry: the sentinel
+ * holds `want` and is strictly newer than each git dir's config (a missing
+ * config never invalidates). Mirrors gstack-slug's `-nt` check at whole
+ * seconds, the resolution of macOS's bash 3.2, so a same-second edit always
+ * probes again.
+ */
+function healProbeCleared(file: string, want: string, gitDirs: string[]): boolean {
+  try {
+    if (readFileSync(file, "utf-8") !== want) return false;
+    const sentinel = Math.floor(statSync(file).mtimeMs / 1000);
+    return gitDirs.every((dir) => {
+      if (!dir) return true;
+      try {
+        return sentinel > Math.floor(statSync(join(dir, "config")).mtimeMs / 1000);
+      } catch {
+        return true;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** `refresh` rewrites an unchanged entry too, so its mtime moves (the heal-probe sentinel). */
+function writeCacheEntry(file: string, content: string, opts: { refresh?: boolean } = {}): void {
   try {
     let current: string | undefined;
     try {
@@ -345,7 +388,7 @@ function writeCacheEntry(file: string, content: string): void {
     } catch {
       // no entry yet
     }
-    if (current === content) return;
+    if (current === content && !opts.refresh) return;
     mkdirSync(dirname(file), { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
     writeFileSync(tmp, content, "utf-8");
@@ -459,13 +502,18 @@ export function slugFromEnvironment(
           // package.json etc. (no .git) is legit #2212 sticky identity.
           existsSync(join(projectRoot, ".git")) &&
           (() => {
+            // Single-shot per cache entry (twin of gstack-slug's _degraded_ancestor_shape).
+            const probed = healProbedFile(home, cwd);
+            const want = `${cached}\n${toMsysPath(projectRoot)}\n${toMsysPath(cwd)}`;
+            if (healProbeCleared(probed, want, healProbeGitDirs(cwd, projectRoot))) return false;
             const rootOrigin = spawnSync("git", ["-C", projectRoot, "remote", "get-url", "origin"], {
               encoding: "utf-8",
             });
             const rootUrl = rootOrigin.status === 0 ? (rootOrigin.stdout || "").trim() : "";
-            if (rootUrl) return false; // marker root's own origin resolves — not the stray shape
-            const r = resolveRemote();
-            return r.url !== "" && r.root !== projectRoot;
+            const r = rootUrl ? null : resolveRemote(); // marker root's own origin resolves — not the stray shape
+            if (r && r.url !== "" && r.root !== projectRoot) return true;
+            writeCacheEntry(probed, want, { refresh: true });
+            return false;
           })();
         if (!oldBugShape && !degradedAncestorShape) {
           slug = cached;

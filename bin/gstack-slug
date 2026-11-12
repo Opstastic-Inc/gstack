@@ -42,7 +42,8 @@
 # an older gstack is recomputed once (one git spawn) and rewritten as v2; it
 # keeps its value unless it is exactly the pre-#3003 last-two slug of a
 # 3+-segment remote, so #2212 sticky identity survives the upgrade and later
-# cache hits stay git-free.
+# cache hits stay git-free. The degraded-ancestor heal check keeps a sentinel
+# under slug-cache/heal-probed/ so it probes git once per entry (see 1b).
 #
 # Resolution order (highest precedence first):
 #   0. $GSTACK_PROJECT_SLUG env override (documented escape hatch)
@@ -486,6 +487,45 @@ fi
 #       Legit remote-adopting stickiness is safe too: there the repo that
 #       adopted the remote IS the marker root (REMOTE_ROOT == PROJECT_ROOT),
 #       so the heal never fires.
+#     The heal probe costs 1-3 git spawns and its precondition (cached ==
+#     root basename, root has .git) is the steady state of every remoteless
+#     and legit-sticky repo, so it is single-shot per cache entry: a probe
+#     that clears the entry writes slug-cache/heal-probed/<pwd key> holding
+#     the cached slug, root and pwd it checked. A later hit skips the probe
+#     while that record matches and is strictly newer than the config of the
+#     repository's common dir and of every .git dir from pwd up to the root,
+#     the repos the probe asks (`git remote add` rewrites a config, so a
+#     remote added later still heals). Stats only, no fork. The sentinel is
+#     its own file; entry files keep the "v2:<slug>" format older readers
+#     parse.
+HEAL_PROBED_FILE="$CACHE_DIR/heal-probed/$CACHE_KEY"
+_heal_probe_cleared() { # $1 the record a clearing probe wrote
+  local probed="" dir="$PROJECT_DIR" parent="" depth=0
+  { IFS= read -r -d '' probed < "$HEAL_PROBED_FILE"; } 2>/dev/null || true
+  [[ "$probed" == "$1" ]] || return 1
+  # -nt is true when the config is missing, so a non-repo level never invalidates.
+  [[ -z "$GIT_COMMON_DIR" || "$HEAL_PROBED_FILE" -nt "$GIT_COMMON_DIR/config" ]] || return 1
+  while [[ $depth -lt 64 ]]; do
+    [[ "$HEAL_PROBED_FILE" -nt "$dir/.git/config" ]] || return 1
+    [[ "$dir" != "$PROJECT_ROOT" ]] || return 0
+    parent="${dir%/*}"
+    [[ -n "$parent" && "$parent" != "$dir" ]] || return 0
+    dir="$parent"
+    depth=$((depth + 1))
+  done
+  return 0
+}
+_degraded_ancestor_shape() {
+  local want=""
+  printf -v want '%s\n%s\n%s' "$_CACHED" "$PROJECT_ROOT" "$PROJECT_DIR"
+  ! _heal_probe_cleared "$want" || return 1
+  if ! git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1 \
+    && { _resolve_remote; [[ -n "$REMOTE_URL" && "$REMOTE_ROOT" != "$PROJECT_ROOT" ]]; }; then
+    return 0
+  fi
+  _write_cache_entry "$HEAL_PROBED_FILE" "$want"
+  return 1
+}
 _CACHE_V2=0
 LEGACY_NOTICE_SLUG=""
 _ENTRY_FILE=""
@@ -507,9 +547,7 @@ if [[ -z "$SLUG" && -n "$_ENTRY_FILE" ]]; then
     fi
     if [[ "$_CACHED" == "$_PWD_BASE" && -n "$PROJECT_ROOT" && "$PROJECT_ROOT" != "$PROJECT_DIR" ]]; then
       : # old-bug shape — recompute below and self-heal the cache
-    elif [[ -n "$PROJECT_ROOT" && "$_CACHED" == "$_ROOT_BASE" && -e "$PROJECT_ROOT/.git" ]] \
-      && ! git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1 \
-      && { _resolve_remote; [[ -n "$REMOTE_URL" && "$REMOTE_ROOT" != "$PROJECT_ROOT" ]]; }; then
+    elif [[ -n "$PROJECT_ROOT" && "$_CACHED" == "$_ROOT_BASE" && -e "$PROJECT_ROOT/.git" ]] && _degraded_ancestor_shape; then
       : # degraded-ancestor (stray-repo) shape — recompute below and self-heal the cache
     elif [[ "$_CACHE_V2" -eq 1 ]]; then
       SLUG="$_CACHED"
