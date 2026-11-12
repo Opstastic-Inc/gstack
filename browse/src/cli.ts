@@ -859,6 +859,112 @@ export class ServerLockError extends Error {
   }
 }
 
+/** A lock with no pid yet belongs to an owner between open('wx') and writing
+ *  its pid for this long; an older one was left by a crash at that point. */
+const SERVER_LOCK_WRITE_GRACE_MS = 5_000;
+/** The break lock is held only for one read + unlink; an older one was left
+ *  by a crashed breaker. */
+const SERVER_LOCK_BREAK_STALE_MS = 5_000;
+
+/**
+ * True when the server lock's owner is gone: its pid is dead, or it wrote no
+ * pid and the lock is older than the write grace. A lock with no pid that is
+ * younger than the grace is a live owner mid-write, never stale. Throws the
+ * read/stat error (ENOENT when the lock vanished).
+ */
+function isStaleServerLock(lockPath: string): boolean {
+  const holderPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+  if (holderPid > 0) return !isProcessAlive(holderPid);
+  return isOlderThan(lockPath, SERVER_LOCK_WRITE_GRACE_MS);
+}
+
+function isOlderThan(filePath: string, ageMs: number): boolean {
+  return Date.now() - fs.statSync(filePath).mtimeMs > ageMs;
+}
+
+/** True while `filePath` is still the file open on `fd` (same inode). The fd
+ *  stays open, so its inode number cannot be reused by a new file meanwhile. */
+function isOwnFile(fd: number, filePath: string): boolean {
+  try {
+    return fs.fstatSync(fd).ino === fs.statSync(filePath).ino;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+/** Close `fd` and remove `filePath` only when it is still the file we created:
+ *  a lock that another starter broke and re-created is never removed. */
+function releaseOwnFile(fd: number, filePath: string): void {
+  const own = isOwnFile(fd, filePath);
+  fs.closeSync(fd);
+  if (own) safeUnlink(filePath);
+}
+
+/**
+ * Remove a stale server lock without racing other starters (#1084 follow-up).
+ * Two starters that both read the same dead pid used to both unlink the path,
+ * so the slower one removed the faster one's NEW live lock and both started a
+ * daemon. Removal now runs under `<lock>.break` (exclusive create), and the
+ * staleness is checked again under it. Returns true when the caller may retry
+ * the acquire, false when another starter is breaking the lock or the lock has
+ * a live owner again.
+ */
+function breakStaleServerLock(lockPath: string): boolean {
+  const breakPath = `${lockPath}.break`;
+  let fd: number;
+  try {
+    fd = fs.openSync(breakPath, 'wx');
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') throw err;
+    return recoverStaleBreakLock(breakPath);
+  }
+  try {
+    fs.writeSync(fd, `${process.pid}\n`);
+    if (!isStaleServerLock(lockPath)) return false;
+    safeUnlink(lockPath);
+    return true;
+  } finally {
+    releaseOwnFile(fd, breakPath);
+  }
+}
+
+/**
+ * Another starter holds the break lock, or a crashed breaker left it. Recover
+ * only the second case, and never by unlinking the path after a separate stat:
+ * two recoverers that both saw the same old file would then remove a NEW live
+ * break lock. The file is renamed aside first (atomic, so only one recoverer
+ * gets it), then checked; a live one is linked back (fails on EEXIST, so it
+ * never replaces a newer one). Returns true when the caller may retry.
+ */
+function recoverStaleBreakLock(breakPath: string): boolean {
+  try {
+    if (!isOlderThan(breakPath, SERVER_LOCK_BREAK_STALE_MS)) return false;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return true; // breaker finished — retry
+    throw err;
+  }
+  const aside = `${breakPath}.${process.pid}.${Date.now()}`;
+  try {
+    fs.renameSync(breakPath, aside);
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return true; // another recoverer or the breaker removed it
+    throw err;
+  }
+  try {
+    if (isOlderThan(aside, SERVER_LOCK_BREAK_STALE_MS)) return true;
+    // The file was replaced after our stat: it is a live breaker's. Put it back.
+    try {
+      fs.linkSync(aside, breakPath);
+    } catch (err: any) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+    return false;
+  } finally {
+    safeUnlink(aside);
+  }
+}
+
 /**
  * Acquire an exclusive lockfile to prevent concurrent ensureServer() races (TOCTOU).
  * Returns a cleanup function that releases the lock, or null when another
@@ -877,9 +983,18 @@ export function acquireServerLock(
     // 'wx' — create exclusively, fails if file already exists (atomic check-and-create)
     // Using string flag instead of numeric constants for Bun Windows compatibility
     const fd = fs.openSync(lockPath, 'wx');
-    fs.writeSync(fd, `${process.pid}\n`);
-    fs.closeSync(fd);
-    return () => { safeUnlink(lockPath); };
+    let own = false;
+    try {
+      fs.writeSync(fd, `${process.pid}\n`);
+      // A stall longer than the write grace before this write lets another
+      // starter break the empty lock and create its own: then the path is no
+      // longer our file, and the lock is theirs. The fd stays open until
+      // release so the inode check there stays valid.
+      own = isOwnFile(fd, lockPath);
+    } finally {
+      if (!own) fs.closeSync(fd);
+    }
+    return own ? () => releaseOwnFile(fd, lockPath) : null;
   } catch (err: any) {
     if (err?.code === 'ENOENT') {
       // Lock dir missing — create it and retry once.
@@ -893,12 +1008,11 @@ export function acquireServerLock(
     // EEXIST — real contention. Check if the holder is still alive.
     // Depth cap 5 bounds the stale-lock unlink/retry livelock.
     try {
-      const holderPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
-      if (holderPid && isProcessAlive(holderPid)) {
+      if (!isStaleServerLock(lockPath)) {
         return null; // Another live process holds the lock
       }
-      // Stale lock — remove and retry
-      fs.unlinkSync(lockPath);
+      // Stale lock — remove it under the break lock, then retry.
+      if (!breakStaleServerLock(lockPath)) return null;
       if (depth >= 5) return null;
       return acquireServerLock(lockPath, depth + 1);
     } catch (readErr: any) {

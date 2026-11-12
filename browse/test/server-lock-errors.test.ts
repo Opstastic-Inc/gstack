@@ -83,9 +83,13 @@ describe('acquireServerLock (#1084 error honesty)', () => {
     fs.unlinkSync(lockPath);
   });
 
-  test('EEXIST + garbage lockfile content: NaN pid is treated as stale, lock acquired', () => {
+  test('EEXIST + old garbage lockfile content: NaN pid past the write grace is stale, lock acquired', () => {
+    // A FRESH lock with no pid is a live owner mid-write (pinned in
+    // server-lock-race.test.ts); only one older than the write grace is stale.
     const lockPath = path.join(tmpRoot, 'garbage.lock');
-    fs.writeFileSync(lockPath, 'not-a-pid\n'); // parseInt → NaN → falsy → stale path
+    fs.writeFileSync(lockPath, 'not-a-pid\n'); // parseInt → NaN → no pid
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, old, old);
     const release = acquireServerLock(lockPath);
     expect(release).not.toBeNull();
     // Our pid replaced the garbage — the stale lock was removed and re-acquired.
