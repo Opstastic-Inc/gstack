@@ -18,7 +18,8 @@
  *      TMPDIR-honoring CI/sandbox environments)
  *   4. TEMP_ONLY = [TEMP_DIR] for remote file serving (prevents project file exfil)
  *      and for output paths a scoped token without "write" chooses (prevents
- *      a read-only agent from writing into the project)
+ *      a read-only agent from writing into the project; when the cwd is
+ *      inside TEMP_DIR, the cwd is excluded from that set)
  *   5. Safe directories and targets go through the same realpath (#3104):
  *      on Windows `fs.realpathSync` keeps an 8.3 short name such as
  *      C:\Users\BURCIN~1 while `fs.realpathSync.native` expands it, so mixing
@@ -59,6 +60,12 @@ export const SAFE_DIRECTORIES = [...TEMP_DIRS, process.cwd()].map(resolveSafeDir
 
 const TEMP_ONLY = [TEMP_DIR].map(resolveSafeDir);
 
+// The project directory, when it sits inside TEMP_DIR (a checkout or worktree
+// under /tmp). A read-only output path must stay out of it. A cwd that holds
+// TEMP_DIR (/, /private, /tmp itself) is not a project and is not excluded.
+const CWD = resolveSafeDir(process.cwd());
+const PROJECT_IN_TEMP = TEMP_ONLY.some(dir => isPathWithin(CWD, dir) && !isPathWithin(dir, CWD)) ? [CWD] : [];
+
 /**
  * Validate a file path for writing (screenshot, pdf, download, scrape, archive).
  *
@@ -75,15 +82,18 @@ export function validateOutputPath(filePath: string): void {
 
 /**
  * Validate an output path a scoped token without the "write" scope chose
- * (screenshot, pdf, responsive). TEMP_DIR only, the directory GET /file
- * serves, so a read-only agent cannot write into the project.
+ * (screenshot, pdf, responsive, snapshot -a/-H). TEMP_DIR only, the directory
+ * GET /file serves, and never the project directory when the daemon's cwd is
+ * inside TEMP_DIR, so a read-only agent cannot write into the project.
  */
 export function validateTempOutputPath(filePath: string): void {
-  validateOutputPathWithin(filePath, TEMP_ONLY);
+  validateOutputPathWithin(filePath, TEMP_ONLY, PROJECT_IN_TEMP);
 }
 
-function validateOutputPathWithin(filePath: string, safeDirs: string[]): void {
-  const reject = () => { throw new Error(`Path must be within: ${safeDirs.join(', ')}`); };
+function validateOutputPathWithin(filePath: string, safeDirs: string[], excludedDirs: string[] = []): void {
+  const outside = excludedDirs.length ? ` and outside: ${excludedDirs.join(', ')}` : '';
+  const reject = () => { throw new Error(`Path must be within: ${safeDirs.join(', ')}${outside}`); };
+  const allowed = (p: string) => safeDirs.some(dir => isPathWithin(p, dir)) && !excludedDirs.some(dir => isPathWithin(p, dir));
   for (const spelling of new Set([filePath, path.resolve(filePath)])) {
     const root = path.parse(spelling).root;
     let resolved = path.resolve(root || '.');
@@ -98,7 +108,7 @@ function validateOutputPathWithin(filePath: string, safeDirs: string[]): void {
         fs.lstatSync(next);
       } catch (err: any) {
         resolved = path.join(resolved, foldMissing(component));
-        if (err?.code === 'ENOENT' && safeDirs.some(dir => isPathWithin(resolved, dir))) continue;
+        if (err?.code === 'ENOENT' && allowed(resolved)) continue;
         reject();
       }
       try {
@@ -107,7 +117,7 @@ function validateOutputPathWithin(filePath: string, safeDirs: string[]): void {
         reject();
       }
     }
-    if (!safeDirs.some(dir => isPathWithin(resolved, dir))) reject();
+    if (!allowed(resolved)) reject();
   }
 }
 
