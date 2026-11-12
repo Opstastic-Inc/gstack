@@ -62,6 +62,7 @@ on:
       - 'bin/gstack-session-update'
       - 'bin/gstack-ff-update'
       - 'bin/gstack-claude-root.sh'
+      - 'bin/gstack-windows-detect.sh'
       - 'bin/gstack-browser-ensure'
       - 'bin/gstack-path-spelling.sh'
       - 'lib/path-spelling.ts'

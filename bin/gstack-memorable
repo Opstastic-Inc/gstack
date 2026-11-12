@@ -39,6 +39,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GSTACK_CONFIG="$SCRIPT_DIR/gstack-config"
 . "$(dirname "$0")/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $(dirname "$0")/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
 . "$(dirname "$0")/gstack-claude-root.sh" || { echo "$0: $(dirname "$0")/gstack-claude-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade" >&2; exit 1; }
+. "$(dirname "$0")/gstack-windows-detect.sh" || { echo "$0: $(dirname "$0")/gstack-windows-detect.sh is missing. fix: reinstall with ./setup or /gstack-upgrade" >&2; exit 1; }
 gstack_state_root_select
 STATE_DIR="$_gstack_sr_root"
 SETTINGS_FILE="${GSTACK_SETTINGS_FILE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json}"
@@ -67,12 +68,10 @@ SETTINGS_HOOK="$CANONICAL_GSTACK_ROOT/bin/gstack-settings-hook"
 EGRESS_BIN="$CANONICAL_GSTACK_ROOT/bin/gstack-egress"
 [ -x "$EGRESS_BIN" ] || EGRESS_BIN="$SCRIPT_DIR/gstack-egress"
 
-# Platform detection copied from setup:76-79 (TODO D24). Windows support for
-# this bridge is deferred whole (no process groups to contain the vendor).
-IS_WINDOWS=0
-case "${GSTACK_MEMORABLE_TEST_UNAME:-$(uname -s)}" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
-esac
+# Platform detection shared with setup (bin/gstack-windows-detect.sh); tests
+# set GSTACK_MEMORABLE_TEST_UNAME. Windows support for this bridge is deferred
+# whole (no process groups to contain the vendor).
+IS_WINDOWS="$(gstack_windows_flag "${GSTACK_MEMORABLE_TEST_UNAME:-}")"
 
 usage() {
   cat <<USAGE

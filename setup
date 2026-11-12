@@ -308,6 +308,7 @@ gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
 . "$SOURCE_GSTACK_DIR/bin/gstack-path-spelling.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-path-spelling.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-skill-name.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-skill-name.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-claude-root.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-claude-root.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
+. "$SOURCE_GSTACK_DIR/bin/gstack-windows-detect.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-windows-detect.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-install-registry.sh is missing. fix: reinstall from a fresh clone (docs/ADDING_A_HOST.md)" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-render-claude.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
 . "$SOURCE_GSTACK_DIR/bin/gstack-host-renders.sh" || { echo "$0: $SOURCE_GSTACK_DIR/bin/gstack-host-renders.sh is missing. fix: reinstall from a fresh clone" >&2; exit 1; }
@@ -672,10 +673,7 @@ if { [ "$CODEX_REPO_LOCAL" -eq 1 ] || [ "$HOST" = codex ] || { [ "$HOST" = auto 
   exit 1
 fi
 
-IS_WINDOWS=0
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT) IS_WINDOWS=1 ;;
-esac
+IS_WINDOWS="$(gstack_windows_flag)"
 
 # Windows: binaries are compiled with .exe suffix
 if [ "$IS_WINDOWS" -eq 1 ]; then
