@@ -18,6 +18,8 @@ import { runInRequestTab } from './session-tabs';
 import { handleReadCommand, hasOutArg } from './read-commands';
 import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
+import { isFileNavigationUrl, validateNavigationUrl } from './url-validation';
+import { TEMP_DIR } from './platform';
 import { hasActivePicker } from './cookie-picker-routes';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, DOM_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand, buildUnknownCommandError, ALL_COMMANDS } from './commands';
 import {
@@ -1026,6 +1028,26 @@ async function handleCommandInternalImpl(
           result: JSON.stringify({
             error: `Domain not allowed by your token scope`,
             hint: `Allowed domains: ${tokenInfo.domains?.join(', ') || 'none configured'}`,
+          }),
+        };
+      }
+    }
+
+    // file: navigation is held to TEMP_DIR, the rule GET /file applies, so a
+    // paired agent cannot open a project file (`goto file://./.env`, which the
+    // local safe-dirs rule allows) and read it back with `text`.
+    const navigationUrls = command === 'goto' || command === 'newtab' ? args.slice(0, 1)
+      : command === 'diff' ? args.slice(0, 2) : [];
+    for (const navigationUrl of navigationUrls) {
+      if (!isFileNavigationUrl(navigationUrl)) continue;
+      try {
+        await validateNavigationUrl(navigationUrl, { fileAccess: 'temp-only' });
+      } catch (err: any) {
+        return {
+          status: 403, json: true,
+          result: JSON.stringify({
+            error: err.message,
+            hint: `Scoped tokens can open file: URLs only in ${TEMP_DIR}.`,
           }),
         };
       }
