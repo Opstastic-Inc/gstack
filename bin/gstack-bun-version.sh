@@ -53,6 +53,67 @@ gstack_bun_archive_sha256() {
   esac
 }
 
+# gstack_bun_install_hint UNAME_MS [CPUINFO] [LIBC] — the recipe ./setup
+# prints when Bun is missing (UNAME_MS is `uname -ms`). It downloads the exact
+# $GSTACK_BUN_TESTED release archive, checks it against the SHA-256 that
+# gstack_bun_archive_sha256 pins for the target, or against the release's
+# SHASUMS256.txt where gstack pins none (macOS, musl), and installs to
+# ~/.bun/bin only when the check passes and the unpacked bun reports
+# $GSTACK_BUN_TESTED on this machine, as bin/gstack-capy-install checks it. On
+# Linux the target follows the host as bun.sh/install picks it: -musl when
+# LIBC (default: gstack_bun_libc) is musl, with Bun's Alpine prerequisite
+# named above the recipe, and -baseline on x86_64 when CPUINFO (default
+# /proc/cpuinfo) lists no avx2, as bin/gstack-capy-install does. An unknown
+# platform gets the Bun docs link and no checksum claim.
+# test/setup-bun-install-hint.test.ts runs the recipe.
+gstack_bun_install_hint() {
+  _gb_m=""
+  case "$1" in
+    Linux\ *) [ "${3:-$(gstack_bun_libc)}" = musl ] && _gb_m=-musl ;;
+  esac
+  case "$1" in
+    'Linux x86_64') _gb_t=linux-x64$_gb_m
+      grep -q avx2 "${2:-/proc/cpuinfo}" 2>/dev/null || _gb_t=$_gb_t-baseline ;;
+    'Linux aarch64'|'Linux arm64') _gb_t=linux-aarch64$_gb_m ;;
+    'Darwin arm64') _gb_t=darwin-aarch64 ;;
+    'Darwin x86_64') _gb_t=darwin-x64 ;;
+    *) printf 'Install Bun %s for this platform from https://bun.sh/docs/installation, then re-run ./setup\n' "$GSTACK_BUN_TESTED"
+       return 0 ;;
+  esac
+  if command -v sha256sum >/dev/null 2>&1; then _gb_sum="sha256sum"; else _gb_sum="shasum -a 256"; fi
+  _gb_sha=$(gstack_bun_archive_sha256 "$_gb_t") || _gb_sha=""
+  if [ -n "$_gb_sha" ]; then
+    printf 'Install Bun %s from its release archive, checked against the SHA-256 gstack pins:\n' "$GSTACK_BUN_TESTED"
+  else
+    printf "Install Bun %s from its release archive, checked against the release's SHASUMS256.txt (gstack pins no hash for %s):\n" "$GSTACK_BUN_TESTED" "$_gb_t"
+  fi
+  [ -n "$_gb_m" ] && printf 'On Alpine, first install the libraries Bun needs: apk add libstdc++ libgcc\n'
+  printf '  BUN_VERSION="%s" target="%s"\n' "$GSTACK_BUN_TESTED" "$_gb_t"
+  printf '  url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION"; tmp=$(mktemp -d)\n'
+  printf '  curl -fsSL "$url/bun-$target.zip" -o "$tmp/bun-$target.zip"\n'
+  if [ -n "$_gb_sha" ]; then
+    printf '  (cd "$tmp" && echo "%s  bun-$target.zip" | %s -c -) \\\n' "$_gb_sha" "$_gb_sum"
+  else
+    printf '  curl -fsSL "$url/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt"\n'
+    # grep into a file, not a pipe: macOS /sbin/sha256sum -c passes empty input.
+    printf '  (cd "$tmp" && grep " bun-$target.zip\\$" SHASUMS256.txt > bun.sha256 && %s -c bun.sha256) \\\n' "$_gb_sum"
+  fi
+  printf '    && unzip -q "$tmp/bun-$target.zip" -d "$tmp" \\\n'
+  printf '    && { [ "$("$tmp/bun-$target/bun" --version 2>/dev/null)" = "$BUN_VERSION" ] || { echo "the downloaded bun does not report $BUN_VERSION on this machine; nothing installed" >&2; false; }; } \\\n'
+  printf '    && mkdir -p "$HOME/.bun/bin" && install -m 0755 "$tmp/bun-$target/bun" "$HOME/.bun/bin/bun" \\\n'
+  printf '    && echo "bun installed: add $HOME/.bun/bin to PATH, then re-run ./setup"\n'
+  printf '  rm -rf "$tmp"\n'
+}
+
+# gstack_bun_libc [ROOT] — prints musl when ROOT (default /) has
+# etc/alpine-release or a musl loader (lib/ld-musl-*.so.1, present on musl
+# images that ship no ldd), or ldd reports musl; else glibc.
+gstack_bun_libc() {
+  [ -e "${1:-}/etc/alpine-release" ] && { echo musl; return 0; }
+  for _gb_f in "${1:-}"/lib/ld-musl-*.so.1; do [ -e "$_gb_f" ] && { echo musl; return 0; }; done
+  if ldd --version 2>&1 | grep -qi musl; then echo musl; else echo glibc; fi
+}
+
 # _gstack_bun_parse <version> — sets _gb_core ("MAJOR MINOR PATCH" as decimal
 # integers) and _gb_pre (prerelease, may be empty); returns 1 when malformed.
 # A leading "v" and "+build" metadata are ignored.

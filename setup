@@ -281,12 +281,7 @@ esac
 . "$(dirname "$0")/bin/gstack-bun-version.sh" 2>/dev/null || { echo "$0: bin/gstack-bun-version.sh is missing; nothing was installed or changed. Fix: reinstall gstack (git clone https://github.com/garrytan/gstack)" >&2; exit 1; }
 if ! command -v bun >/dev/null 2>&1; then
   echo "Error: bun is required but not installed." >&2
-  echo "Install with checksum verification:" >&2
-  echo "  BUN_VERSION=\"$GSTACK_BUN_TESTED\"" >&2
-  echo '  tmpfile=$(mktemp)' >&2
-  echo '  curl -fsSL "https://bun.sh/install" -o "$tmpfile"' >&2
-  echo '  echo "Verify checksum before running: sha256sum $tmpfile   # or: shasum -a 256 $tmpfile"' >&2
-  echo '  bash "$tmpfile" "bun-v$BUN_VERSION" && rm "$tmpfile"   # the script pins by argument, not by env' >&2
+  gstack_bun_install_hint "$(uname -ms 2>/dev/null)" >&2
   exit 1
 fi
 _BUN_FOUND="$(bun --version 2>/dev/null | head -1)"
