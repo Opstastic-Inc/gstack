@@ -1509,11 +1509,13 @@ runtime is the incident this check exists for. The default Capy cloud image
 ships 1.3.14, so a fresh Capy machine fails here until the installer upgrades
 Bun.
 
-**Fix.** `bin/gstack-capy-install` upgrades Bun through setup's
-checksum-verified recipe before running `./setup`. By hand: download
-`https://bun.sh/install`, verify its SHA-256 against `GSTACK_BUN_INSTALL_SHA`
-in `bin/gstack-bun-version.sh`, then `BUN_VERSION=1.4.2 bash <file>` and
-re-run `./setup`.
+**Fix.** `bin/gstack-capy-install` installs Bun from its SHA-256-verified release
+archive before running `./setup`. By hand: print the recipe setup prints when
+Bun is missing, `. bin/gstack-bun-version.sh && gstack_bun_install_hint
+"$(uname -ms)"`, and run it: it downloads the
+`bun-v1.4.2` release archive, checks its SHA-256 (the pinned
+`gstack_bun_archive_sha256` on Linux, the release's `SHASUMS256.txt` on
+macOS) and installs it only on a match, then re-run `./setup`.
 
 <a id="doctor-project-pin-mismatch"></a>
 ### `FAIL pins — bun <version> outside engines.bun >=1.4.2 (package.json:<line>; ...) (PROJECT_PIN_MISMATCH; ...)`
@@ -1582,13 +1584,14 @@ front-loads the install on machines that want it now.
 
 **Meaning.** The installer checks `git`, `curl`, `node` and `jq` before
 `./setup`, and installs Bun when it is absent or below the supported minimum.
-One of them is missing, or the Bun install script's checksum did not match
-`GSTACK_BUN_INSTALL_SHA` (the download is discarded, nothing runs).
+One of them is missing, or the Bun release archive's SHA-256 did not match
+`gstack_bun_archive_sha256` in `bin/gstack-bun-version.sh` (the download is
+discarded, nothing is installed).
 
 **Fix.** Install the named tool (`apt-get install -y jq`, Node from nodejs.org
 or nvm), then re-run `bin/gstack-capy-install`. A checksum mismatch means the
-upstream installer changed: update `GSTACK_BUN_INSTALL_SHA` only after
-reviewing the new script.
+download is not the release archive: update `gstack_bun_archive_sha256` only
+after checking the release's `SHASUMS256.txt`.
 
 <a id="capy-install-launch-file-unwritable"></a>
 ### `gstack: fail launch-file — could not write the launch file <path>; fix: ... (LAUNCH_FILE_UNWRITABLE)`
