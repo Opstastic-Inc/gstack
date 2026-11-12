@@ -17,10 +17,15 @@
  *   - a lock left by a crash (dead pid, or empty and older than the grace)
  *     is recovered, so the next start is never stuck;
  *   - stale-lock removal is serialized by a short-lived break lock, and a
- *     break lock left by a crashed breaker is recovered by age.
+ *     break lock left by a crashed breaker is recovered by age;
+ *   - a stale break lock is recovered by rename-then-check, so two
+ *     recoverers of one stale break file never both enter the break section;
+ *   - a lock or break file is removed on release only while its inode is
+ *     still the one its owner created (an owner whose lock was broken during
+ *     a long stall gets no lock and never removes the new owner's lock).
  */
 
-import { describe, test, expect, afterAll } from 'bun:test';
+import { describe, test, expect, afterAll, spyOn } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -154,5 +159,117 @@ describe('acquireServerLock: stale-lock rule', () => {
     expect(release).not.toBeNull();
     expect(fs.existsSync(`${lockPath}.break`)).toBe(false);
     release!();
+  });
+});
+
+/**
+ * Fixed-order interleavings, in process. spyOn on the `fs` namespace reaches
+ * cli.ts's own `import * as fs`. Each spy is restored in `finally`.
+ */
+describe('acquireServerLock: fixed-order interleavings', () => {
+  function patchFs<K extends 'statSync' | 'readFileSync' | 'writeSync'>(
+    name: K,
+    wrap: (orig: (typeof fs)[K]) => (typeof fs)[K],
+  ): () => void {
+    const orig = fs[name];
+    const spy = spyOn(fs, name).mockImplementation(wrap(orig) as any);
+    return () => spy.mockRestore();
+  }
+
+  test('two starters that recover one stale break file: only one enters the break section', () => {
+    // B stats the old break file. Before B acts, A recovers the same file and
+    // creates its own NEW break file (A now holds the break lock). B must not
+    // remove A's live break file and must not take the lock.
+    const lockPath = path.join(tmpRoot, 'two-recoverers.lock');
+    const breakPath = `${lockPath}.break`;
+    fs.writeFileSync(lockPath, `${DEAD_PID}\n`);
+    fs.writeFileSync(breakPath, `${DEAD_PID}\n`);
+    backdate(breakPath, 60_000);
+    let interleaved = false;
+    const restore = patchFs('statSync', (orig) => ((p: fs.PathLike, ...rest: unknown[]) => {
+      const result = (orig as any)(p, ...rest);
+      if (p === breakPath && !interleaved) {
+        interleaved = true;
+        fs.unlinkSync(breakPath); // A: recovers the stale break file
+        fs.writeFileSync(breakPath, 'A\n'); // A: holds a fresh break lock
+      }
+      return result; // B: still sees the OLD stat
+    }) as any);
+    let release: (() => void) | null;
+    try {
+      release = acquireServerLock(lockPath);
+    } finally {
+      restore();
+    }
+    expect(interleaved).toBe(true);
+    expect(release).toBeNull();
+    expect(fs.readFileSync(breakPath, 'utf8')).toBe('A\n');
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(DEAD_PID);
+    expect(fs.readdirSync(tmpRoot).filter((f) => f.startsWith('two-recoverers.lock.break.'))).toEqual([]);
+    fs.unlinkSync(breakPath);
+    fs.unlinkSync(lockPath);
+  });
+
+  test('a breaker whose break file was taken over does not remove the new break file on exit', () => {
+    const lockPath = path.join(tmpRoot, 'taken-break.lock');
+    const breakPath = `${lockPath}.break`;
+    fs.writeFileSync(lockPath, `${DEAD_PID}\n`);
+    let reads = 0;
+    const restore = patchFs('readFileSync', (orig) => ((p: any, ...rest: unknown[]) => {
+      // Read 1: the staleness check before the break lock. Read 2: the check
+      // under it — another starter replaces the break file at that point.
+      if (p === lockPath && ++reads === 2) {
+        fs.unlinkSync(breakPath);
+        fs.writeFileSync(breakPath, 'other\n');
+      }
+      return (orig as any)(p, ...rest);
+    }) as any);
+    let release: (() => void) | null;
+    try {
+      release = acquireServerLock(lockPath);
+    } finally {
+      restore();
+    }
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(fs.readFileSync(breakPath, 'utf8')).toBe('other\n');
+    release?.();
+    fs.unlinkSync(breakPath);
+  });
+
+  test('an owner whose lock was broken while it stalled before the pid write gets no lock', () => {
+    // Between open('wx') and writeSync, another starter judges the empty lock
+    // stale, removes it and creates its own. The stalled owner must see that.
+    const lockPath = path.join(tmpRoot, 'stalled-owner.lock');
+    let stalled = false;
+    const restore = patchFs('writeSync', (orig) => ((fd: number, data: any, ...rest: unknown[]) => {
+      if (!stalled && data === `${process.pid}\n` && fs.existsSync(lockPath)) {
+        stalled = true;
+        fs.unlinkSync(lockPath);
+        fs.writeFileSync(lockPath, `${DEAD_PID}\n`);
+      }
+      return (orig as any)(fd, data, ...rest);
+    }) as any);
+    let release: (() => void) | null;
+    try {
+      release = acquireServerLock(lockPath);
+    } finally {
+      restore();
+    }
+    expect(stalled).toBe(true);
+    expect(release).toBeNull();
+    expect(fs.readFileSync(lockPath, 'utf8').trim()).toBe(DEAD_PID);
+    fs.unlinkSync(lockPath);
+  });
+
+  test('release does not remove a lock that another starter now owns', () => {
+    const lockPath = path.join(tmpRoot, 'release-other.lock');
+    const release = acquireServerLock(lockPath);
+    expect(release).not.toBeNull();
+    // Our lock was broken (e.g. after a long stall) and another starter owns the path.
+    fs.unlinkSync(lockPath);
+    fs.writeFileSync(lockPath, 'other\n');
+    release!();
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe('other\n');
+    fs.unlinkSync(lockPath);
   });
 });
