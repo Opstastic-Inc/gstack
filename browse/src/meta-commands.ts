@@ -3,14 +3,14 @@
  */
 
 import type { BrowserManager } from './browser-manager';
-import { handleSnapshot } from './snapshot';
+import { handleSnapshot, parseSnapshotArgs } from './snapshot';
 import { getCleanText } from './read-commands';
 import { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS, PAGE_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand } from './commands';
 import { handleDomainSkillCommand } from './domain-skill-commands';
 import { handleSkillCommand } from './browser-skill-commands';
 import { validateNavigationUrl } from './url-validation';
 import { checkScope, type TokenInfo } from './token-registry';
-import { validateOutputPath, validateReadPath, SAFE_DIRECTORIES, escapeRegExp } from './path-security';
+import { validateOutputPath, validateTempOutputPath, validateReadPath, SAFE_DIRECTORIES, escapeRegExp } from './path-security';
 import { guardScreenshotBuffer, guardScreenshotPath } from './screenshot-size-guard';
 import * as Diff from 'diff';
 import * as fs from 'fs';
@@ -249,6 +249,25 @@ export interface MetaCommandOpts {
   executeCommand?: (body: { command: string; args?: string[]; tabId?: number }, tokenInfo?: TokenInfo | null) => Promise<{ status: number; result: string; json?: boolean }>;
   /** The port the daemon is listening on (needed by `$B skill run` to point spawned scripts at the daemon). */
   daemonPort?: number;
+}
+
+/** A scoped token without "write" may not write into the project (cwd). */
+function isTempOutputOnly(tokenInfo?: TokenInfo | null): boolean {
+  return !!tokenInfo && tokenInfo.clientId !== 'root' && !tokenInfo.scopes.includes('write');
+}
+
+/**
+ * Validate an output path the caller chose. screenshot, pdf and snapshot sit
+ * in the read scope and responsive in meta, so a scoped token without "write"
+ * may only write into TEMP_DIR, the same rule GET /file applies; the cwd (a
+ * project write) needs "write", like `--out` in server.ts.
+ */
+function validateOutputPathForToken(filePath: string, tokenInfo?: TokenInfo | null): void {
+  if (isTempOutputOnly(tokenInfo)) {
+    validateTempOutputPath(filePath);
+  } else {
+    validateOutputPath(filePath);
+  }
 }
 
 export async function handleMetaCommand(
@@ -496,7 +515,7 @@ export async function handleMetaCommand(
         targetSelector = flagSelector;
       }
 
-      validateOutputPath(outputPath);
+      validateOutputPathForToken(outputPath, tokenInfo);
 
       if (clipRect && targetSelector) {
         throw new Error('Cannot use --clip with a selector/ref — choose one');
@@ -549,7 +568,7 @@ export async function handleMetaCommand(
     case 'pdf': {
       const page = bm.getPage();
       const parsed = parsePdfArgs(args);
-      validateOutputPath(parsed.output);
+      validateOutputPathForToken(parsed.output, tokenInfo);
 
       // If --toc: wait up to 3s for Paged.js to signal by setting
       // window.__pagedjsAfterFired = true. If the polyfill isn't injected
@@ -580,7 +599,7 @@ export async function handleMetaCommand(
       refuseWhileDevice(bm.getActiveSession(), 'responsive');
       const page = bm.getPage();
       const prefix = args[0] || `${TEMP_DIR}/browse-responsive`;
-      validateOutputPath(prefix);
+      validateOutputPathForToken(prefix, tokenInfo);
       const viewports = [
         { name: 'mobile', width: 375, height: 812 },
         { name: 'tablet', width: 768, height: 1024 },
@@ -592,7 +611,7 @@ export async function handleMetaCommand(
       for (const vp of viewports) {
         await page.setViewportSize({ width: vp.width, height: vp.height });
         const screenshotPath = `${prefix}-${vp.name}.png`;
-        validateOutputPath(screenshotPath);
+        validateOutputPathForToken(screenshotPath, tokenInfo);
         await page.screenshot({ path: screenshotPath, fullPage: true });
         await guardScreenshotPath(screenshotPath);
         results.push(`${vp.name} (${vp.width}x${vp.height}): ${screenshotPath}`);
@@ -727,6 +746,12 @@ export async function handleMetaCommand(
     // ─── Snapshot ─────────────────────────────────────
     case 'snapshot': {
       const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
+      // -o names the -a/-H screenshot file. Check it before any page work;
+      // handleSnapshot keeps its own [TEMP_DIR, cwd] check for other callers.
+      if (isTempOutputOnly(tokenInfo)) {
+        const { annotate, heatmap, outputPath } = parseSnapshotArgs(args);
+        if (outputPath && (annotate || heatmap)) validateOutputPathForToken(outputPath, tokenInfo);
+      }
       const snapshotResult = await handleSnapshot(args, bm.getActiveSession(), {
         splitForScoped: !!isScoped,
       });
