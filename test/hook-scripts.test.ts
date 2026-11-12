@@ -704,6 +704,13 @@ describe('check-careful.sh', () => {
       ['cd app && git -C sub push --force origin feature', 'force-push'],
       ['git -c push.default=current -C no-such-dir push -f', 'force-push'],
       ['git --git-dir=../app/.git --work-tree=../app push origin +feature', 'force-push'],
+      // An option argument is one shell word: backslash escapes and escaped
+      // quotes inside "..." do not end it.
+      ['git -C my\\ repo reset --hard', 'uncommitted'],
+      ['git -C my\\ repo push --force origin feature', 'force-push'],
+      ['git -C my\\ repo checkout .', 'uncommitted'],
+      ['git -c x.y=a\\ b reset --hard', 'uncommitted'],
+      ['git -c "x.y=a \\"b c\\"" reset --hard', 'uncommitted'],
     ])('git global options before the subcommand still warn: %s', (command, reason) => {
       const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(command));
       expect(exitCode).toBe(0);
@@ -711,7 +718,29 @@ describe('check-careful.sh', () => {
       expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(reason);
     });
 
-    test.each(['git -C app status', 'git -c color.ui=always log --oneline', 'git --no-pager -C app diff --stat'])(
+    // `-c alias.<name>=<command>` defines the subcommand that runs: the alias
+    // is checked as the command it defines.
+    test.each([
+      ["git -c alias.nuke='reset --hard' nuke", 'uncommitted'],
+      ["git -c alias.fp='push --force' fp origin feature", 'force-push'],
+      ["git -c alias.wipe='checkout .' wipe", 'uncommitted'],
+      ['git -c "alias.Nuke=reset --hard" -C app NUKE', 'uncommitted'],
+      ['git --config-env=alias.nuke=NUKE_CMD nuke', 'alias'],
+      ['git --config-env alias.nuke=NUKE_CMD nuke', 'alias'],
+    ])('an inline git alias is checked as the command it defines: %s', (command, reason) => {
+      const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(command));
+      expect(exitCode).toBe(0);
+      expect(output.hookSpecificOutput?.permissionDecision).toBe('ask');
+      expect(output.hookSpecificOutput?.permissionDecisionReason).toContain(reason);
+    });
+
+    test.each([
+      'git -C app status',
+      'git -c color.ui=always log --oneline',
+      'git --no-pager -C app diff --stat',
+      "git -c alias.st='status --short' st",
+      'git -C my\\ repo log --oneline',
+    ])(
       'git global options on a safe subcommand allow: %s',
       (command) => {
         const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(command));
@@ -972,6 +1001,52 @@ describe('check-careful.sh', () => {
         } finally {
           fs.rmSync(outside, { recursive: true, force: true });
         }
+      });
+    });
+
+    // A -c value with a space is one word: the -C after it still names the repo.
+    test.each([
+      (repoDir: string) => `git -c 'a.b=x y' -C ${repoDir} push -f origin main`,
+      (repoDir: string) => `git -c "a.b=x \\"y z\\"" -C ${repoDir} push -f origin main`,
+      (repoDir: string) => `git -c a.b=x\\ y -C ${repoDir} push -f origin main`,
+    ])('a -c value with a space before -C <repo> still denies from outside the repo (%#)', (makeCommand) => {
+      withGitRepo('main', 'feature', (repoDir) => {
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-careful-outside-'));
+        try {
+          const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(makeCommand(repoDir)), undefined, outside);
+          expect(exitCode).toBe(0);
+          expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
+          expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('default branch (main)');
+        } finally {
+          fs.rmSync(outside, { recursive: true, force: true });
+        }
+      });
+    });
+
+    // A quoted -C path with a space resolves: the lookup reads that repo.
+    test('git -C "<repo with a space>" push --force origin <default branch> denies from outside the repo', () => {
+      withGitRepo('main', 'feature', (repoDir) => {
+        const spaced = `${repoDir} two`;
+        fs.renameSync(repoDir, spaced);
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-careful-outside-'));
+        try {
+          const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput(`git -C "${spaced}" push --force origin main`), undefined, outside);
+          expect(exitCode).toBe(0);
+          expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
+        } finally {
+          fs.rmSync(outside, { recursive: true, force: true });
+          fs.renameSync(spaced, repoDir);
+        }
+      });
+    });
+
+    // An inline alias that defines a force-push is a force-push.
+    test("git -c alias.fp='push -f' fp origin <default branch> denies", () => {
+      withGitRepo('main', 'feature', (repoDir) => {
+        const { exitCode, output } = runHook(CAREFUL_SCRIPT, carefulInput("git -c alias.fp='push -f' fp origin main"), undefined, repoDir);
+        expect(exitCode).toBe(0);
+        expect(output.hookSpecificOutput?.permissionDecision).toBe('deny');
+        expect(output.hookSpecificOutput?.permissionDecisionReason).toContain('default branch (main)');
       });
     });
 

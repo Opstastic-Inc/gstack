@@ -85,8 +85,12 @@ proceed.
 
 Git global options before the subcommand (`-C <dir>`, `-c <k>=<v>`,
 `--git-dir`, `--work-tree`, `--no-pager` and the others in git(1)) are skipped,
-so `git -C app push -f` is checked as `git push -f`. For a force-push, the
-default branch is read from the repo that `-C`/`--git-dir`/`--work-tree` name.
+so `git -C app push -f` is checked as `git push -f`. An option argument is one
+shell word, quotes and backslash escapes included (`-C my\ repo`). An inline
+alias is checked as the command it defines: `git -c alias.nuke='reset --hard'
+nuke` is `git reset --hard`, and an alias from `--config-env` (a command in an
+environment variable) always asks. For a force-push, the default branch is read
+from the repo that `-C`/`--git-dir`/`--work-tree` name.
 
 ## HIGH tier (hard deny)
 
