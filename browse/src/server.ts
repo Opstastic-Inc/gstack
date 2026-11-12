@@ -1156,7 +1156,7 @@ async function handleCommandInternalImpl(
       }
     } else if (WRITE_COMMANDS.has(command)) {
       const session = browserManager.getActiveSession();
-      result = await browserManager.failIfNavigationBlocked(session.getPage(), handleWriteCommand(command, args, session, browserManager));
+      result = await browserManager.failIfNavigationBlocked(session.getPage(), () => handleWriteCommand(command, args, session, browserManager), tokenInfo);
     } else if (META_COMMANDS.has(command)) {
       // Pass chain depth + executeCommand callback so chain routes subcommands
       // through the full security pipeline (scope, domain, tab, wrapping).

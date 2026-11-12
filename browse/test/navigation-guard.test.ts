@@ -46,7 +46,7 @@ afterAll(async () => {
 
 function run(command: string, args: string[]): Promise<string> {
   const session = bm.getActiveSession();
-  return bm.failIfNavigationBlocked(session.getPage(), handleWriteCommand(command, args, session, bm));
+  return bm.failIfNavigationBlocked(session.getPage(), () => handleWriteCommand(command, args, session, bm));
 }
 
 // While Bun's promise matchers (rejects/resolves) wait, each Playwright round-trip takes
