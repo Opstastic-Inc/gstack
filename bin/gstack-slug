@@ -42,7 +42,9 @@
 # an older gstack is recomputed once (one git spawn) and rewritten as v2; it
 # keeps its value unless it is exactly the pre-#3003 last-two slug of a
 # 3+-segment remote, so #2212 sticky identity survives the upgrade and later
-# cache hits stay git-free.
+# cache hits stay git-free. The degraded-ancestor heal check keeps a sentinel
+# under slug-cache/heal-probed/ so it probes git once per entry while the git
+# configs it reads stay unchanged (see 1b).
 #
 # Resolution order (highest precedence first):
 #   0. $GSTACK_PROJECT_SLUG env override (documented escape hatch)
@@ -486,6 +488,84 @@ fi
 #       Legit remote-adopting stickiness is safe too: there the repo that
 #       adopted the remote IS the marker root (REMOTE_ROOT == PROJECT_ROOT),
 #       so the heal never fires.
+#     The heal probe costs 1-3 git spawns and its precondition (cached ==
+#     root basename, root has .git) is the steady state of every remoteless
+#     and legit-sticky repo, so it is single-shot per cache entry: a probe
+#     that clears the entry writes slug-cache/heal-probed/<pwd key> holding
+#     the cached slug, the root, the pwd and a fingerprint of every git
+#     config the probe reads. That is each level from the pwd up to the root:
+#     a .git directory's config; for a .git FILE (linked worktree, submodule)
+#     its gitdir's config.worktree and its common dir's config. Each config
+#     is listed as present (+) or absent (-), and each present one is stat'ed
+#     as dev:inode:size:mtime. A later hit skips the probe only while the
+#     record is byte-identical. git rewrites a config through a lock file and
+#     a rename (a new inode), and a moved-in .git or a new repo changes the
+#     list, so any such change probes again. The fingerprint is taken BEFORE
+#     the probe, so a `git remote add` that races the probe also differs on
+#     the next hit. One stat spawn replaces 1-3 git spawns. The sentinel is
+#     its own file; entry files keep the "v2:<slug>" format older readers
+#     parse.
+HEAL_PROBED_FILE="$CACHE_DIR/heal-probed/$CACHE_KEY"
+# Sets HEAL_RECORD to the record for this hit (twin of healProbeRecord in
+# lib/bin-context.ts; the two must stay byte-identical so bash and TS share the
+# sentinel). No subshell: the stat is the only spawn.
+HEAL_RECORD=""
+_heal_probe_record() {
+  local dir="$PROJECT_DIR" parent="" depth=0 line="" gitdir="" common="" f="" list="" stats=""
+  local -a files=() present=()
+  while [[ $depth -lt 64 ]]; do
+    if [[ -d "$dir/.git" ]]; then
+      files+=("$dir/.git/config")
+    elif [[ -f "$dir/.git" ]]; then
+      line=""; { IFS= read -r line < "$dir/.git"; } 2>/dev/null || true
+      line="${line%$'\r'}"
+      gitdir=""
+      if [[ "$line" == gitdir:* ]]; then gitdir="${line#gitdir:}"; gitdir="${gitdir#"${gitdir%%[! ]*}"}"; fi
+      if [[ -n "$gitdir" ]]; then
+        [[ "$gitdir" == /* || "$gitdir" =~ ^[A-Za-z]: ]] || gitdir="$dir/$gitdir"
+        common="$gitdir"
+        if [[ -f "$gitdir/commondir" ]]; then
+          line=""; { IFS= read -r line < "$gitdir/commondir"; } 2>/dev/null || true
+          line="${line%$'\r'}"
+          if [[ -n "$line" ]]; then
+            common="$line"
+            [[ "$common" == /* || "$common" =~ ^[A-Za-z]: ]] || common="$gitdir/$common"
+          fi
+        fi
+        files+=("$gitdir/config.worktree" "$common/config")
+      fi
+    fi
+    [[ "$dir" != "$PROJECT_ROOT" ]] || break
+    parent="${dir%/*}"
+    [[ -n "$parent" && "$parent" != "$dir" ]] || break
+    dir="$parent"
+    depth=$((depth + 1))
+  done
+  for f in ${files[@]+"${files[@]}"}; do
+    if [[ -e "$f" ]]; then list+="+$f"$'\n'; present+=("$f"); else list+="-$f"$'\n'; fi
+  done
+  if [[ ${#present[@]} -gt 0 ]]; then
+    # Pick the stat dialect from $OSTYPE: trying GNU first would cost a failed
+    # spawn on every macOS hit, and BSD's -f on Linux prints a filesystem block.
+    case "${OSTYPE:-}" in
+      darwin*|*bsd*) stats=$(stat -f '%d:%i:%z:%m' -- "${present[@]}" 2>/dev/null) || stats="" ;;
+      *) stats=$(stat -c '%d:%i:%s:%Y' -- "${present[@]}" 2>/dev/null) || stats="" ;;
+    esac
+  fi
+  printf -v HEAL_RECORD '%s\n%s\n%s\n%s%s' "$_CACHED" "$PROJECT_ROOT" "$PROJECT_DIR" "$list" "$stats"
+}
+_degraded_ancestor_shape() {
+  local probed=""
+  _heal_probe_record # before the probe: a config that changes during it differs next hit
+  { IFS= read -r -d '' probed < "$HEAL_PROBED_FILE"; } 2>/dev/null || true
+  [[ "$probed" != "$HEAL_RECORD" ]] || return 1
+  if ! git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1 \
+    && { _resolve_remote; [[ -n "$REMOTE_URL" && "$REMOTE_ROOT" != "$PROJECT_ROOT" ]]; }; then
+    return 0
+  fi
+  _write_cache_entry "$HEAL_PROBED_FILE" "$HEAL_RECORD"
+  return 1
+}
 _CACHE_V2=0
 LEGACY_NOTICE_SLUG=""
 _ENTRY_FILE=""
@@ -507,9 +587,7 @@ if [[ -z "$SLUG" && -n "$_ENTRY_FILE" ]]; then
     fi
     if [[ "$_CACHED" == "$_PWD_BASE" && -n "$PROJECT_ROOT" && "$PROJECT_ROOT" != "$PROJECT_DIR" ]]; then
       : # old-bug shape — recompute below and self-heal the cache
-    elif [[ -n "$PROJECT_ROOT" && "$_CACHED" == "$_ROOT_BASE" && -e "$PROJECT_ROOT/.git" ]] \
-      && ! git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1 \
-      && { _resolve_remote; [[ -n "$REMOTE_URL" && "$REMOTE_ROOT" != "$PROJECT_ROOT" ]]; }; then
+    elif [[ -n "$PROJECT_ROOT" && "$_CACHED" == "$_ROOT_BASE" && -e "$PROJECT_ROOT/.git" ]] && _degraded_ancestor_shape; then
       : # degraded-ancestor (stray-repo) shape — recompute below and self-heal the cache
     elif [[ "$_CACHE_V2" -eq 1 ]]; then
       SLUG="$_CACHED"
