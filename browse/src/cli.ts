@@ -859,6 +859,63 @@ export class ServerLockError extends Error {
   }
 }
 
+/** A lock with no pid yet belongs to an owner between open('wx') and writing
+ *  its pid for this long; an older one was left by a crash at that point. */
+const SERVER_LOCK_WRITE_GRACE_MS = 5_000;
+/** The break lock is held only for one read + unlink; an older one was left
+ *  by a crashed breaker. */
+const SERVER_LOCK_BREAK_STALE_MS = 5_000;
+
+/**
+ * True when the server lock's owner is gone: its pid is dead, or it wrote no
+ * pid and the lock is older than the write grace. A lock with no pid that is
+ * younger than the grace is a live owner mid-write, never stale. Throws the
+ * read/stat error (ENOENT when the lock vanished).
+ */
+function isStaleServerLock(lockPath: string): boolean {
+  const holderPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+  if (holderPid > 0) return !isProcessAlive(holderPid);
+  return Date.now() - fs.statSync(lockPath).mtimeMs > SERVER_LOCK_WRITE_GRACE_MS;
+}
+
+/**
+ * Remove a stale server lock without racing other starters (#1084 follow-up).
+ * Two starters that both read the same dead pid used to both unlink the path,
+ * so the slower one removed the faster one's NEW live lock and both started a
+ * daemon. Removal now runs under `<lock>.break` (exclusive create), and the
+ * staleness is checked again under it. Returns true when the caller may retry
+ * the acquire, false when another starter is breaking the lock or the lock has
+ * a live owner again.
+ */
+function breakStaleServerLock(lockPath: string): boolean {
+  const breakPath = `${lockPath}.break`;
+  let fd: number;
+  try {
+    fd = fs.openSync(breakPath, 'wx');
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') throw err;
+    // Another starter is breaking the lock now. Recover only a break lock
+    // that a crashed breaker left behind.
+    try {
+      if (Date.now() - fs.statSync(breakPath).mtimeMs <= SERVER_LOCK_BREAK_STALE_MS) return false;
+      safeUnlink(breakPath);
+      return true;
+    } catch (statErr: any) {
+      if (statErr?.code === 'ENOENT') return true; // breaker finished — retry
+      throw statErr;
+    }
+  }
+  try {
+    fs.writeSync(fd, `${process.pid}\n`);
+    fs.closeSync(fd);
+    if (!isStaleServerLock(lockPath)) return false;
+    safeUnlink(lockPath);
+    return true;
+  } finally {
+    safeUnlink(breakPath);
+  }
+}
+
 /**
  * Acquire an exclusive lockfile to prevent concurrent ensureServer() races (TOCTOU).
  * Returns a cleanup function that releases the lock, or null when another
@@ -893,12 +950,11 @@ export function acquireServerLock(
     // EEXIST — real contention. Check if the holder is still alive.
     // Depth cap 5 bounds the stale-lock unlink/retry livelock.
     try {
-      const holderPid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
-      if (holderPid && isProcessAlive(holderPid)) {
+      if (!isStaleServerLock(lockPath)) {
         return null; // Another live process holds the lock
       }
-      // Stale lock — remove and retry
-      fs.unlinkSync(lockPath);
+      // Stale lock — remove it under the break lock, then retry.
+      if (!breakStaleServerLock(lockPath)) return null;
       if (depth >= 5) return null;
       return acquireServerLock(lockPath, depth + 1);
     } catch (readErr: any) {
