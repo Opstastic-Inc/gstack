@@ -342,45 +342,83 @@ function healProbedFile(stateRoot: string, cwd: string): string {
   return join(stateRoot, "slug-cache", "heal-probed", basename(slugCacheFile(stateRoot, cwd)));
 }
 
-/** The .git dirs the heal probe asks: the repository's common dir, then each level from `cwd` up to `root`. */
-function healProbeGitDirs(cwd: string, root: string): string[] {
-  const dirs = [gitCommonDir(cwd)];
+/** A git path as gstack-slug writes it, and the native path to read. */
+type HealProbePath = { shown: string; native: string };
+
+/** The first line of `file`, without a CR, or "" when it is unreadable. */
+function firstLine(file: string): string {
+  try {
+    return readFileSync(file, "utf-8").split("\n")[0].replace(/\r$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/** `p` resolved against `base` the way gstack-slug does it: plain concatenation, no normalizing. */
+function underGitBase(base: HealProbePath, p: string): HealProbePath {
+  return /^\/|^[A-Za-z]:/.test(p) ? { shown: p, native: p } : { shown: `${base.shown}/${p}`, native: `${base.native}/${p}` };
+}
+
+/**
+ * The heal-probe record for this hit: the cached slug, the root, the cwd, and a
+ * fingerprint of every git config the probe reads — each level from `cwd` up
+ * to `root`: a .git directory's config; for a .git FILE its gitdir's
+ * config.worktree and its common dir's config. Each config is listed as present
+ * (+) or absent (-), then each present one as dev:inode:size:mtime. Twin of
+ * gstack-slug's _heal_probe_record: byte-identical, so the resolvers share the
+ * sentinel.
+ */
+function healProbeRecord(cached: string, root: string, cwd: string): string {
+  const files: HealProbePath[] = [];
   let dir = cwd;
   for (let depth = 0; depth < 64; depth += 1) {
-    dirs.push(join(dir, ".git"));
+    const here = { shown: toMsysPath(dir), native: dir };
+    const dotGit = join(dir, ".git");
+    let kind: "dir" | "file" | "" = "";
+    try {
+      const st = statSync(dotGit);
+      kind = st.isDirectory() ? "dir" : st.isFile() ? "file" : "";
+    } catch {
+      // no .git at this level
+    }
+    if (kind === "dir") {
+      files.push(underGitBase(here, ".git/config"));
+    } else if (kind === "file") {
+      const line = firstLine(dotGit);
+      const gitdir = line.startsWith("gitdir:") ? line.slice("gitdir:".length).replace(/^ +/, "") : "";
+      if (gitdir) {
+        const gd = underGitBase(here, gitdir);
+        const commondir = isFile(`${gd.native}/commondir`) ? firstLine(`${gd.native}/commondir`) : "";
+        const common = commondir ? underGitBase(gd, commondir) : gd;
+        files.push(underGitBase(gd, "config.worktree"), underGitBase(common, "config"));
+      }
+    }
     const parent = dirname(dir);
     if (dir === root || parent === dir) break;
     dir = parent;
   }
-  return dirs;
-}
-
-/**
- * True when a degraded-ancestor probe already cleared this entry: the sentinel
- * holds `want` and is strictly newer than each git dir's config (a missing
- * config never invalidates). Mirrors gstack-slug's `-nt` check at whole
- * seconds, the resolution of macOS's bash 3.2, so a same-second edit always
- * probes again.
- */
-function healProbeCleared(file: string, want: string, gitDirs: string[]): boolean {
-  try {
-    if (readFileSync(file, "utf-8") !== want) return false;
-    const sentinel = Math.floor(statSync(file).mtimeMs / 1000);
-    return gitDirs.every((dir) => {
-      if (!dir) return true;
-      try {
-        return sentinel > Math.floor(statSync(join(dir, "config")).mtimeMs / 1000);
-      } catch {
-        return true;
-      }
-    });
-  } catch {
-    return false;
+  let list = "";
+  const present: string[] = [];
+  for (const f of files) {
+    const there = existsSync(f.native);
+    list += `${there ? "+" : "-"}${f.shown}\n`;
+    if (there) present.push(f.native);
   }
+  let stats = "";
+  try {
+    stats = present
+      .map((f) => {
+        const st = lstatSync(f, { bigint: true });
+        return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs / 1_000_000_000n}`;
+      })
+      .join("\n");
+  } catch {
+    stats = ""; // a config vanished mid-read: gstack-slug's stat fails the same way
+  }
+  return `${cached}\n${toMsysPath(root)}\n${toMsysPath(cwd)}\n${list}${stats}`;
 }
 
-/** `refresh` rewrites an unchanged entry too, so its mtime moves (the heal-probe sentinel). */
-function writeCacheEntry(file: string, content: string, opts: { refresh?: boolean } = {}): void {
+function writeCacheEntry(file: string, content: string): void {
   try {
     let current: string | undefined;
     try {
@@ -388,7 +426,7 @@ function writeCacheEntry(file: string, content: string, opts: { refresh?: boolea
     } catch {
       // no entry yet
     }
-    if (current === content && !opts.refresh) return;
+    if (current === content) return;
     mkdirSync(dirname(file), { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
     writeFileSync(tmp, content, "utf-8");
@@ -503,16 +541,21 @@ export function slugFromEnvironment(
           existsSync(join(projectRoot, ".git")) &&
           (() => {
             // Single-shot per cache entry (twin of gstack-slug's _degraded_ancestor_shape).
+            // The record is taken BEFORE the probe: a config that changes during it differs next hit.
             const probed = healProbedFile(home, cwd);
-            const want = `${cached}\n${toMsysPath(projectRoot)}\n${toMsysPath(cwd)}`;
-            if (healProbeCleared(probed, want, healProbeGitDirs(cwd, projectRoot))) return false;
+            const want = healProbeRecord(cached, projectRoot, cwd);
+            try {
+              if (readFileSync(probed, "utf-8") === want) return false;
+            } catch {
+              // no sentinel yet
+            }
             const rootOrigin = spawnSync("git", ["-C", projectRoot, "remote", "get-url", "origin"], {
               encoding: "utf-8",
             });
             const rootUrl = rootOrigin.status === 0 ? (rootOrigin.stdout || "").trim() : "";
             const r = rootUrl ? null : resolveRemote(); // marker root's own origin resolves — not the stray shape
             if (r && r.url !== "" && r.root !== projectRoot) return true;
-            writeCacheEntry(probed, want, { refresh: true });
+            writeCacheEntry(probed, want);
             return false;
           })();
         if (!oldBugShape && !degradedAncestorShape) {
