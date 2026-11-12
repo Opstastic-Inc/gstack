@@ -13,7 +13,7 @@
  * Remaining bytes = actual cookie value
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -39,6 +39,8 @@ const CHROMIUM_EPOCH_OFFSET = 11644473600000000n;
 const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-cookie-fixtures-'));
 const FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies.db');
 const LINUX_FIXTURE_DB = path.join(FIXTURE_DIR, 'test-cookies-linux.db');
+// The developer's real home, read before any test replaces os.homedir().
+const REAL_HOME = os.homedir();
 
 // ─── Encryption Helper ──────────────────────────────────────────
 
@@ -228,32 +230,26 @@ afterAll(() => {
 // 2. Decrypting them with the module's decryption logic
 // The actual DB path resolution is tested separately.
 
+// Installs a fixture Cookies DB under a temporary HOME. os.homedir() points at
+// that HOME only while run() executes, so the developer's real browser profiles
+// are never written, even when the test process is killed mid-run.
 async function withInstalledProfile<T>(
   relativeBrowserDir: string,
   sourceDb: string,
   run: () => Promise<T>,
   profile = 'Default',
 ): Promise<T> {
-  const homeDir = os.homedir();
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-cookie-home-'));
   const profileDir = path.join(homeDir, relativeBrowserDir, profile);
-  const cookiesPath = path.join(profileDir, 'Cookies');
-  const backupPath = path.join(profileDir, `Cookies.backup-${crypto.randomUUID()}`);
-  const hadOriginal = fs.existsSync(cookiesPath);
-
   fs.mkdirSync(profileDir, { recursive: true });
-  if (hadOriginal) fs.copyFileSync(cookiesPath, backupPath);
-  fs.copyFileSync(sourceDb, cookiesPath);
+  fs.copyFileSync(sourceDb, path.join(profileDir, 'Cookies'));
 
+  const homedir = spyOn(os, 'homedir').mockReturnValue(homeDir);
   try {
     return await run();
   } finally {
-    if (hadOriginal) {
-      fs.copyFileSync(backupPath, cookiesPath);
-      fs.unlinkSync(backupPath);
-    } else {
-      try { fs.unlinkSync(cookiesPath); } catch {}
-      try { fs.rmdirSync(profileDir); } catch {}
-    }
+    homedir.mockRestore();
+    fs.rmSync(homeDir, { recursive: true, force: true });
   }
 }
 
@@ -440,6 +436,38 @@ describe('Cookie Import Browser', () => {
 
         expect(names).toContain('Chromium');
       });
+    });
+  });
+
+  describe('Real Home Isolation', () => {
+    // A snapshot of the real browser folder: whether it exists, its entries, and
+    // the size and mtime of each profile's Cookies database.
+    function snapshotRealBrowserDir(relativeBrowserDir: string): string {
+      const browserDir = path.join(REAL_HOME, relativeBrowserDir);
+      if (!fs.existsSync(browserDir)) return 'absent';
+      return fs.readdirSync(browserDir).sort().map((entry) => {
+        const cookies = path.join(browserDir, entry, 'Cookies');
+        if (!fs.existsSync(cookies)) return entry;
+        const stat = fs.statSync(cookies);
+        return `${entry}:${stat.size}:${stat.mtimeMs}`;
+      }).join('\n');
+    }
+
+    test('installs profiles under a temporary HOME, never the real one', async () => {
+      const profile = `GstackHomeIsolation-${crypto.randomUUID()}`;
+      const before = snapshotRealBrowserDir('.config/chromium');
+
+      await withInstalledProfile('.config/chromium', LINUX_FIXTURE_DB, async () => {
+        expect(os.homedir()).not.toBe(REAL_HOME);
+        expect(fs.existsSync(path.join(REAL_HOME, '.config/chromium', profile))).toBe(false);
+        expect(snapshotRealBrowserDir('.config/chromium')).toBe(before);
+        // The module resolves the profile through the temporary HOME.
+        const result = listDomains('chromium', profile);
+        expect(result.domains.map((entry: any) => entry.domain)).toContain('.linux-v10.com');
+      }, profile);
+
+      expect(os.homedir()).toBe(REAL_HOME);
+      expect(snapshotRealBrowserDir('.config/chromium')).toBe(before);
     });
   });
 
