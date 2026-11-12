@@ -690,6 +690,17 @@ describe('Cookies and storage', () => {
     const storage = JSON.parse(result);
     expect(storage.localStorage.session_token).toBe('[REDACTED — 6 chars]');
   });
+
+  test('storage redacts the same session keys as cookies', async () => {
+    await handleWriteCommand('goto', [baseUrl + '/basic.html'], bm);
+    await handleReadCommand('storage', ['set', 'sessionid', 'django-session-value'], bm);
+    await handleReadCommand('storage', ['set', 'firebase:authUser:AIzaSyExampleKey:[DEFAULT]', '{"stsTokenManager":{}}'], bm);
+    await handleReadCommand('storage', ['set', 'ui_theme', 'dark'], bm);
+    const storage = JSON.parse(await handleReadCommand('storage', [], bm));
+    expect(storage.localStorage.sessionid).toBe('[REDACTED — 20 chars]');
+    expect(storage.localStorage['firebase:authUser:AIzaSyExampleKey:[DEFAULT]']).toBe('[REDACTED — 22 chars]');
+    expect(storage.localStorage.ui_theme).toBe('dark');
+  });
 });
 
 // ─── Performance ────────────────────────────────────────────────
@@ -1422,6 +1433,21 @@ describe('Cookie command', () => {
     const cookies = await handleReadCommand('cookies', [], bm);
     expect(cookies).toContain('testcookie');
     expect(cookies).toContain('testvalue');
+  });
+
+  test('cookies redacts framework session cookies and keeps others readable', async () => {
+    await handleWriteCommand('goto', [baseUrl + '/basic.html'], bm);
+    await handleWriteCommand('cookie', ['PHPSESSID=php-session-value-1'], bm);
+    await handleWriteCommand('cookie', ['JSESSIONID=java-session-value-2'], bm);
+    await handleWriteCommand('cookie', ['sessionid=django-session-value-3'], bm);
+    await handleWriteCommand('cookie', ['ui_theme=dark-mode-value'], bm);
+
+    const cookies = JSON.parse(await handleReadCommand('cookies', [], bm));
+    const byName = new Map(cookies.map((c: { name: string; value: string }) => [c.name, c.value]));
+    expect(byName.get('PHPSESSID')).toBe('[REDACTED — 19 chars]');
+    expect(byName.get('JSESSIONID')).toBe('[REDACTED — 20 chars]');
+    expect(byName.get('sessionid')).toBe('[REDACTED — 22 chars]');
+    expect(byName.get('ui_theme')).toBe('dark-mode-value');
   });
 
   test('cookie no arg throws', async () => {

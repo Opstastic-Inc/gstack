@@ -231,10 +231,78 @@ describe('cookie redaction — production patterns', () => {
     expect(SENSITIVE_COOKIE_NAME.test('jwt.payload')).toBe(true);
   });
 
+  // Default session cookie names of common web frameworks. Each one carries a
+  // live session id, so `$B cookies` must never print its value.
+  it.each([
+    'PHPSESSID',                         // PHP
+    'JSESSIONID',                        // Java servlet containers (Tomcat, Jetty, Spring)
+    'JSESSIONIDSSO',                     // Tomcat single sign-on
+    'sessionid',                         // Django
+    '__Secure-sessionid',                // Django with a __Secure- prefix
+    'ASP.NET_SessionId',                 // ASP.NET session state
+    'ASPSESSIONIDQSDRATCB',              // classic ASP
+    '.AspNetCore.Cookies',               // ASP.NET Core cookie authentication
+    '.AspNetCore.Identity.Application',  // ASP.NET Core Identity
+    '.AspNetCore.Antiforgery.CfDJ8abc',  // ASP.NET Core antiforgery
+    '.ASPXAUTH',                         // ASP.NET forms authentication
+    '.AspNet.ApplicationCookie',         // ASP.NET Identity (OWIN)
+    'HSID', 'SSID', 'APISID', 'SAPISID', // Google account session
+    'LSID', 'OSID', 'SIDCC',             // Google account session
+    '__Secure-1PSID', '__Secure-3PSID',  // Google account session
+    '__Secure-1PSIDTS', '__Secure-3PAPISID', '__Secure-1PSIDCC',
+    'ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', // Microsoft Entra ID
+    'wordpress_0123456789abcdef0123456789abcdef',      // WordPress (http)
+    'sessionToken', 'accessToken', 'refreshToken',     // camelCase tokens
+    'idToken', 'authToken',
+    'csrftoken',                         // Django
+    'SMSESSION',                         // SiteMinder
+    'MRHSession',                        // F5 APM
+    'iPlanetDirectoryPro',               // OpenAM
+    'li_at',                             // LinkedIn
+    'xs',                                // Facebook
+    'koa.sess',                          // Koa (koa-session)
+    'koa:sess',                          // Koa (older koa-session)
+    'SESS0123456789abcdef0123456789abcdef',  // Drupal (http)
+    'SSESS0123456789abcdef0123456789abcdef', // Drupal (https)
+    'wordpress_logged_in_0123456789abcdef',  // WordPress
+    'wordpress_sec_0123456789abcdef',        // WordPress
+    'CFID',                              // ColdFusion
+    'CFTOKEN',                           // ColdFusion
+    // Already matched before; kept here so the list stays complete.
+    'connect.sid',                       // Express (express-session)
+    '_session',
+    'laravel_session',                   // Laravel
+    '_myapp_session',                    // Rails
+    'ci_session',                        // CodeIgniter
+    'PLAY_SESSION',                      // Play
+    '__Secure-next-auth.session-token',  // NextAuth.js
+    '__Host-next-auth.csrf-token',       // NextAuth.js
+  ])('detects framework session cookie name %s', (name) => {
+    expect(SENSITIVE_COOKIE_NAME.test(name)).toBe(true);
+  });
+
   it('ignores non-sensitive cookie names', () => {
     expect(SENSITIVE_COOKIE_NAME.test('theme')).toBe(false);
     expect(SENSITIVE_COOKIE_NAME.test('locale')).toBe(false);
     expect(SENSITIVE_COOKIE_NAME.test('_ga')).toBe(false);
+  });
+
+  it.each([
+    '_gid', 'lang', 'currency', 'consent', 'cart_count', 'tz',
+    'sidebar_state', 'considered', 'keyboard_layout', 'visit_count',
+    'wordpress_test_cookie', 'cfg_layout', 'assessment_step', 'possession',
+    'possession_id', 'obsession_id', 'assess_id', 'obsessid',
+    'xsmall', 'li_atlas', 'wordpress_settings',
+  ])('keeps non-sensitive cookie name %s readable', (name) => {
+    expect(SENSITIVE_COOKIE_NAME.test(name)).toBe(false);
+  });
+
+  // `storage` uses the same name pattern as `cookies`.
+  it.each([
+    'sessionid', 'sid', 'PHPSESSID',
+    'firebase:authUser:AIzaSyExampleKey:[DEFAULT]', // Firebase Auth persistence
+  ])('detects sensitive storage key %s', (key) => {
+    expect(SENSITIVE_COOKIE_NAME.test(key)).toBe(true);
   });
 
   it('detects sensitive cookie value prefixes', () => {
