@@ -22,6 +22,7 @@ import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { addConsoleEntry, addNetworkEntry, addDialogEntry, networkBuffer, type DialogEntry } from './buffers';
 import { emitActivity } from './activity';
 import { validateNavigationUrl, blockedNavigationReason } from './url-validation';
+import { checkDomain, getClientSession, type TokenInfo } from './token-registry';
 import { TabSession, type DeviceProfile, type RefEntry } from './tab-session';
 import { resolveChromiumProfile, cleanSingletonLocks, resolveConfig } from './config';
 import { ensureProjectProfile } from './chromium-profiles';
@@ -312,6 +313,9 @@ const TAB_STORAGE_READ_TIMEOUT_MS = 5_000;
 
 type TabStorage = { localStorage: Record<string, string>; sessionStorage: Record<string, string> };
 type TabReadKind = 'probe' | 'title' | 'storage';
+/** Per-page navigation guard state: checks still running, the last block
+ * reason, and the scoped tokens whose command is running on the page. */
+type NavigationGuard = { pending: Set<Promise<void>>; blocked: string | null; drivers: TokenInfo[] };
 
 function urlOrigin(url: string): string {
   return URL.canParse(url) ? new URL(url).origin : '';
@@ -416,8 +420,9 @@ export class BrowserManager {
   private restoredTabIds = new Map<number, number>();
   /** Headless launch with BROWSE_EXTENSIONS_DIR: a persistent context (#2281). */
   private extensionContext = false;
-  /** Pending and recorded navigation-guard verdicts per page (D2). */
-  private navigationGuards = new WeakMap<Page, { pending: Set<Promise<void>>; blocked: string | null }>();
+  /** Pending and recorded navigation-guard verdicts per page (D2), and the
+   * scoped tokens running a command on the page right now. */
+  private navigationGuards = new WeakMap<Page, NavigationGuard>();
   /** One pending read per page and kind (#3247). A read that outlives its
    * budget stays queued in the renderer until the page frees up, so a stuck
    * tab reuses it instead of collecting a new one on every /health poll,
@@ -1244,7 +1249,7 @@ export class BrowserManager {
     if (!adopted) this.wirePageEvents(page);
 
     if (normalizedUrl) {
-      await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await this.failIfNavigationBlocked(page, () => page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }));
     }
 
     return id;
@@ -2393,11 +2398,16 @@ export class BrowserManager {
    * Run a command and surface any navigation the guard blocked while it ran.
    * The block reason replaces the command's own result or error (often
    * "navigation interrupted"), so the caller learns why the tab is blank.
+   * `token` is the scoped token running the command: while it runs, every
+   * top-frame navigation of the page must match that token's domains.
    */
-  async failIfNavigationBlocked<T>(page: Page, work: Promise<T>): Promise<T> {
-    const outcome = await work.then((value) => ({ value }), (error) => ({ error }));
+  async failIfNavigationBlocked<T>(page: Page, run: () => Promise<T>, token?: TokenInfo | null): Promise<T> {
     const guard = this.navigationGuards.get(page);
+    const limited = token && guard ? token : null;
+    if (limited) guard!.drivers.push(limited);
+    const outcome = await run().then((value) => ({ value }), (error) => ({ error }));
     while (guard && guard.pending.size > 0) await Promise.all([...guard.pending]);
+    if (limited) guard!.drivers.splice(guard!.drivers.indexOf(limited), 1);
     const blocked = guard?.blocked ?? null;
     if (guard) guard.blocked = null;
     if (blocked) throw new Error(blocked);
@@ -2406,18 +2416,42 @@ export class BrowserManager {
   }
 
   /**
+   * Why a top-frame navigation of this page is outside a scoped token's
+   * domains, or null. The tokens are the ones running a command on the page
+   * now and the token that owns the tab, so the limit checked on the `goto`
+   * argument also holds for the redirects, links, scripts and form submits
+   * that follow it. Root and tokens without domains always pass (checkDomain).
+   */
+  private domainLimitReason(page: Page, guard: NavigationGuard, url: string): string | null {
+    if (url === 'about:blank') return null;
+    const tabId = [...this.pages].find(([, p]) => p === page)?.[0];
+    const ownerId = tabId === undefined ? undefined : this.tabOwnership.get(tabId);
+    const owner = ownerId ? getClientSession(ownerId) : null;
+    for (const token of owner ? [...guard.drivers, owner] : guard.drivers) {
+      if (checkDomain(token, url)) continue;
+      let host = url;
+      try { host = new URL(url).hostname || url; } catch {}
+      return `Domain not allowed by your token scope: ${host}. Allowed domains: ${token.domains?.join(', ')}`;
+    }
+    return null;
+  }
+
+  /**
    * D2: validateNavigationUrl only sees explicit navigations. Redirect hops and
    * page-driven navigations (links, scripts, forms, frames) arrive here as
-   * navigation requests; one that targets a blocked address blanks the tab and
-   * is reported by failIfNavigationBlocked.
+   * navigation requests; one that targets a blocked address, or a top-frame
+   * one outside a scoped token's domains, blanks the tab and is reported by
+   * failIfNavigationBlocked.
    */
   private guardNavigations(page: Page): void {
     if (this.navigationGuards.has(page)) return;
-    const guard = { pending: new Set<Promise<void>>(), blocked: null as string | null };
+    const guard: NavigationGuard = { pending: new Set(), blocked: null, drivers: [] };
     this.navigationGuards.set(page, guard);
     page.on('request', (req) => {
       if (!req.isNavigationRequest()) return;
-      const check: Promise<void> = blockedNavigationReason(req.url()).then(async (reason) => {
+      const outsideDomains = req.frame() === page.mainFrame() ? this.domainLimitReason(page, guard, req.url()) : null;
+      const verdict = outsideDomains ? Promise.resolve(outsideDomains) : blockedNavigationReason(req.url());
+      const check: Promise<void> = verdict.then(async (reason) => {
         if (!reason || page.isClosed()) return;
         guard.blocked = reason;
         console.warn(`[browse] ${reason} (navigation from ${req.frame().url() || 'a new page'}; tab reset to about:blank)`);
