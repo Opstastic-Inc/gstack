@@ -690,6 +690,17 @@ describe('Cookies and storage', () => {
     const storage = JSON.parse(result);
     expect(storage.localStorage.session_token).toBe('[REDACTED — 6 chars]');
   });
+
+  test('storage redacts the same session keys as cookies', async () => {
+    await handleWriteCommand('goto', [baseUrl + '/basic.html'], bm);
+    await handleReadCommand('storage', ['set', 'sessionid', 'django-session-value'], bm);
+    await handleReadCommand('storage', ['set', 'firebase:authUser:AIzaSyExampleKey:[DEFAULT]', '{"stsTokenManager":{}}'], bm);
+    await handleReadCommand('storage', ['set', 'ui_theme', 'dark'], bm);
+    const storage = JSON.parse(await handleReadCommand('storage', [], bm));
+    expect(storage.localStorage.sessionid).toBe('[REDACTED — 20 chars]');
+    expect(storage.localStorage['firebase:authUser:AIzaSyExampleKey:[DEFAULT]']).toBe('[REDACTED — 22 chars]');
+    expect(storage.localStorage.ui_theme).toBe('dark');
+  });
 });
 
 // ─── Performance ────────────────────────────────────────────────

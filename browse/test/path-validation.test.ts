@@ -239,8 +239,27 @@ describe('cookie redaction — production patterns', () => {
     'JSESSIONIDSSO',                     // Tomcat single sign-on
     'sessionid',                         // Django
     '__Secure-sessionid',                // Django with a __Secure- prefix
-    'ASP.NET_SessionId',                 // ASP.NET
+    'ASP.NET_SessionId',                 // ASP.NET session state
     'ASPSESSIONIDQSDRATCB',              // classic ASP
+    '.AspNetCore.Cookies',               // ASP.NET Core cookie authentication
+    '.AspNetCore.Identity.Application',  // ASP.NET Core Identity
+    '.AspNetCore.Antiforgery.CfDJ8abc',  // ASP.NET Core antiforgery
+    '.ASPXAUTH',                         // ASP.NET forms authentication
+    '.AspNet.ApplicationCookie',         // ASP.NET Identity (OWIN)
+    'HSID', 'SSID', 'APISID', 'SAPISID', // Google account session
+    'LSID', 'OSID', 'SIDCC',             // Google account session
+    '__Secure-1PSID', '__Secure-3PSID',  // Google account session
+    '__Secure-1PSIDTS', '__Secure-3PAPISID', '__Secure-1PSIDCC',
+    'ESTSAUTH', 'ESTSAUTHPERSISTENT', 'ESTSAUTHLIGHT', // Microsoft Entra ID
+    'wordpress_0123456789abcdef0123456789abcdef',      // WordPress (http)
+    'sessionToken', 'accessToken', 'refreshToken',     // camelCase tokens
+    'idToken', 'authToken',
+    'csrftoken',                         // Django
+    'SMSESSION',                         // SiteMinder
+    'MRHSession',                        // F5 APM
+    'iPlanetDirectoryPro',               // OpenAM
+    'li_at',                             // LinkedIn
+    'xs',                                // Facebook
     'koa.sess',                          // Koa (koa-session)
     'koa:sess',                          // Koa (older koa-session)
     'SESS0123456789abcdef0123456789abcdef',  // Drupal (http)
@@ -272,8 +291,18 @@ describe('cookie redaction — production patterns', () => {
     '_gid', 'lang', 'currency', 'consent', 'cart_count', 'tz',
     'sidebar_state', 'considered', 'keyboard_layout', 'visit_count',
     'wordpress_test_cookie', 'cfg_layout', 'assessment_step', 'possession',
+    'possession_id', 'obsession_id', 'assess_id', 'obsessid',
+    'xsmall', 'li_atlas', 'wordpress_settings',
   ])('keeps non-sensitive cookie name %s readable', (name) => {
     expect(SENSITIVE_COOKIE_NAME.test(name)).toBe(false);
+  });
+
+  // `storage` uses the same name pattern as `cookies`.
+  it.each([
+    'sessionid', 'sid', 'PHPSESSID',
+    'firebase:authUser:AIzaSyExampleKey:[DEFAULT]', // Firebase Auth persistence
+  ])('detects sensitive storage key %s', (key) => {
+    expect(SENSITIVE_COOKIE_NAME.test(key)).toBe(true);
   });
 
   it('detects sensitive cookie value prefixes', () => {

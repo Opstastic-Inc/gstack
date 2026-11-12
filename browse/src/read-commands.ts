@@ -18,13 +18,37 @@ import { stripLoneSurrogates } from './sanitize';
 // Re-export for backward compatibility (tests import from read-commands)
 export { validateReadPath } from './path-security';
 
-// Redaction patterns for sensitive cookie/storage values — exported for test coverage
-// The name pattern also covers framework session cookies whose names glue the
-// word to a prefix or suffix: PHPSESSID, JSESSIONID, sessionid (Django),
-// ASP.NET_SessionId, ASPSESSIONID* (classic ASP), koa.sess / koa:sess,
-// SESS<hash> / SSESS<hash> (Drupal), wordpress_logged_in_* / wordpress_sec_*,
-// and CFID / CFTOKEN (ColdFusion).
-export const SENSITIVE_COOKIE_NAME = /(^|[_.:-])(token|secret|key|password|credential|auth|jwt|session|sess|csrf|sid)($|[_.:-])|api.?key|sess(ion)?_?id|^s?sess[0-9a-f]{32}$|^wordpress_(logged_in|sec)_|^cf(id|token)$/i;
+// Redaction patterns for sensitive cookie names and storage keys (one pair, used
+// by both `cookies` and `storage`) — exported for test coverage.
+const SENSITIVE_NAME_PARTS = [
+  // A sensitive word between separators or the start/end of the name.
+  String.raw`(^|[_.:-])(token|secret|key|password|credential|auth|jwt|session|sess|csrf|sid)($|[_.:-])`,
+  String.raw`api.?key`,
+  // Session ids glued to a framework prefix: PHPSESSID, JSESSIONID*, sessionid
+  // (Django), ASP.NET_SessionId, ASPSESSIONID* (classic ASP). The left side is
+  // anchored so possession_id or assess_id stay readable.
+  String.raw`(^|[_.:-]|php|j|asp)sess(ion)?_?id`,
+  // camelCase tokens and Django csrftoken: sessionToken, accessToken, ...
+  String.raw`(session|access|refresh|id|auth|csrf)token`,
+  // Google account session: SID, HSID, SSID, APISID, SAPISID, LSID, OSID,
+  // SIDCC, __Secure-1PSID, __Secure-3PAPISID, __Secure-1PSIDTS, ...
+  String.raw`^(__(secure|host)-)?\d?p?(h|s|api|sapi|l|o)?sid(cc|ts)?$`,
+  // Microsoft Entra ID sign-in.
+  String.raw`^ests(auth|authpersistent|authlight)$`,
+  // ASP.NET Core cookie auth, Identity and antiforgery; ASP.NET forms auth; OWIN.
+  String.raw`^\.(aspnetcore\.(cookies$|identity\.|antiforgery\.)|aspxauth$|aspnet\.applicationcookie$)`,
+  // Drupal SESS<hash> / SSESS<hash>.
+  String.raw`^s?sess[0-9a-f]{32}$`,
+  // WordPress auth (http and https) and logged-in cookies.
+  String.raw`^wordpress_((logged_in|sec)_|[0-9a-f]{32}$)`,
+  // ColdFusion.
+  String.raw`^cf(id|token)$`,
+  // Firebase Auth persistence key in localStorage / sessionStorage.
+  String.raw`^firebase:authuser:`,
+  // SiteMinder, F5 APM, OpenAM, LinkedIn, Facebook.
+  String.raw`^(smsession|mrhsession|iplanetdirectorypro|li_at|xs)$`,
+];
+export const SENSITIVE_COOKIE_NAME = new RegExp(SENSITIVE_NAME_PARTS.join('|'), 'i');
 export const SENSITIVE_COOKIE_VALUE = /^(eyJ|sk-|sk_live_|sk_test_|pk_live_|pk_test_|rk_live_|sk-ant-|ghp_|gho_|github_pat_|xox[bpsa]-|AKIA[A-Z0-9]{16}|AIza|SG\.|Bearer\s|sbp_)/;
 
 /** Detect await keyword, ignoring comments. Accepted risk: await in string literals triggers wrapping (harmless). */
@@ -577,7 +601,7 @@ export async function handleReadCommand(
 
     case 'cookies': {
       const cookies = await page.context().cookies();
-      // Redact cookie values that look like secrets (consistent with storage redaction)
+      // Redact cookie values that look like secrets (same patterns as storage)
       const redacted = cookies.map(c => {
         if (SENSITIVE_COOKIE_NAME.test(c.name) || SENSITIVE_COOKIE_VALUE.test(c.value)) {
           return { ...c, value: `[REDACTED — ${c.value.length} chars]` };
@@ -598,16 +622,14 @@ export async function handleReadCommand(
         localStorage: { ...localStorage },
         sessionStorage: { ...sessionStorage },
       }));
-      // Redact values that look like secrets (tokens, keys, passwords, JWTs)
-      const SENSITIVE_KEY = /(^|[_.-])(token|secret|key|password|credential|auth|jwt|session|csrf)($|[_.-])|api.?key/i;
-      const SENSITIVE_VALUE = /^(eyJ|sk-|sk_live_|sk_test_|pk_live_|pk_test_|rk_live_|sk-ant-|ghp_|gho_|github_pat_|xox[bpsa]-|AKIA[A-Z0-9]{16}|AIza|SG\.|Bearer\s|sbp_)/;
+      // Redact values that look like secrets (same patterns as cookies)
       const redacted = JSON.parse(JSON.stringify(storage));
       for (const storeType of ['localStorage', 'sessionStorage'] as const) {
         const store = redacted[storeType];
         if (!store) continue;
         for (const [key, value] of Object.entries(store)) {
           if (typeof value !== 'string') continue;
-          if (SENSITIVE_KEY.test(key) || SENSITIVE_VALUE.test(value)) {
+          if (SENSITIVE_COOKIE_NAME.test(key) || SENSITIVE_COOKIE_VALUE.test(value)) {
             store[key] = `[REDACTED — ${value.length} chars]`;
           }
         }
