@@ -1513,9 +1513,10 @@ Bun.
 archive before running `./setup`. By hand: print the recipe setup prints when
 Bun is missing, `. bin/gstack-bun-version.sh && gstack_bun_install_hint
 "$(uname -ms)"`, and run it: it downloads the
-`bun-v1.4.2` release archive, checks its SHA-256 (the pinned
-`gstack_bun_archive_sha256` on Linux, the release's `SHASUMS256.txt` on
-macOS) and installs it only on a match, then re-run `./setup`.
+`bun-v1.4.2` release archive for this machine (`-baseline` without AVX2,
+`-musl` on musl libc), checks its SHA-256 (the pinned
+`gstack_bun_archive_sha256` on glibc Linux, the release's `SHASUMS256.txt` on
+macOS and musl) and installs it only on a match, then re-run `./setup`.
 
 <a id="doctor-project-pin-mismatch"></a>
 ### `FAIL pins — bun <version> outside engines.bun >=1.4.2 (package.json:<line>; ...) (PROJECT_PIN_MISMATCH; ...)`

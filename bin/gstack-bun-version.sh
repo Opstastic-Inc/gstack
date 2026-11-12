@@ -53,17 +53,31 @@ gstack_bun_archive_sha256() {
   esac
 }
 
-# gstack_bun_install_hint UNAME_MS — the recipe ./setup prints when Bun is
-# missing (UNAME_MS is `uname -ms`). It downloads the exact
+# gstack_bun_install_hint UNAME_MS [CPUINFO] [LIBC] — the recipe ./setup
+# prints when Bun is missing (UNAME_MS is `uname -ms`). It downloads the exact
 # $GSTACK_BUN_TESTED release archive, checks it against the SHA-256 that
 # gstack_bun_archive_sha256 pins for the target, or against the release's
-# SHASUMS256.txt where gstack pins none (macOS), and installs to ~/.bun/bin
-# only when the check passes. An unknown platform gets the Bun docs link and
-# no checksum claim. test/setup-bun-install-hint.test.ts runs the recipe.
+# SHASUMS256.txt where gstack pins none (macOS, musl), and installs to
+# ~/.bun/bin only when the check passes. On Linux the target follows the host
+# as bun.sh/install picks it: -musl when LIBC is musl (default: musl when
+# /etc/alpine-release exists or ldd reports musl), -baseline on x86_64 when
+# CPUINFO (default /proc/cpuinfo) lists no avx2, as bin/gstack-capy-install
+# does. An unknown platform gets the Bun docs link and no checksum claim.
+# test/setup-bun-install-hint.test.ts runs the recipe.
 gstack_bun_install_hint() {
+  _gb_m=""
   case "$1" in
-    'Linux x86_64') _gb_t=linux-x64 ;;
-    'Linux aarch64'|'Linux arm64') _gb_t=linux-aarch64 ;;
+    Linux\ *)
+      _gb_libc="${3:-}"
+      if [ -z "$_gb_libc" ]; then
+        if [ -e /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then _gb_libc=musl; else _gb_libc=glibc; fi
+      fi
+      [ "$_gb_libc" = musl ] && _gb_m=-musl ;;
+  esac
+  case "$1" in
+    'Linux x86_64') _gb_t=linux-x64$_gb_m
+      grep -q avx2 "${2:-/proc/cpuinfo}" 2>/dev/null || _gb_t=$_gb_t-baseline ;;
+    'Linux aarch64'|'Linux arm64') _gb_t=linux-aarch64$_gb_m ;;
     'Darwin arm64') _gb_t=darwin-aarch64 ;;
     'Darwin x86_64') _gb_t=darwin-x64 ;;
     *) printf 'Install Bun %s for this platform from https://bun.sh/docs/installation, then re-run ./setup\n' "$GSTACK_BUN_TESTED"
@@ -76,7 +90,6 @@ gstack_bun_install_hint() {
   else
     printf "Install Bun %s from its release archive, checked against the release's SHASUMS256.txt (gstack pins no hash for %s):\n" "$GSTACK_BUN_TESTED" "$_gb_t"
   fi
-  [ "$_gb_t" = linux-x64 ] && printf '  # a CPU without AVX2: target="linux-x64-baseline" (also pinned)\n'
   printf '  BUN_VERSION="%s" target="%s"\n' "$GSTACK_BUN_TESTED" "$_gb_t"
   printf '  url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION"; tmp=$(mktemp -d)\n'
   printf '  curl -fsSL "$url/bun-$target.zip" -o "$tmp/bun-$target.zip"\n'

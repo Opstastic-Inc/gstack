@@ -11,7 +11,9 @@ import * as path from 'node:path';
 // gstack_bun_install_hint (bin/gstack-bun-version.sh): the exact release
 // archive, checked against the SHA-256 gstack pins for the target, or against
 // the release's SHASUMS256.txt where gstack pins none, and installed only when
-// the check passes. These tests run the printed recipe with a fake curl.
+// the check passes. On Linux the target follows the host the way
+// bun.sh/install picks it: -baseline without AVX2, -musl on musl libc. These
+// tests run the printed recipe with a fake curl.
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const VERSIONS = path.join(ROOT, 'bin', 'gstack-bun-version.sh');
@@ -21,10 +23,22 @@ afterEach(() => { for (const b of bases.splice(0)) fs.rmSync(b, { recursive: tru
 const sh = (script: string, env: Record<string, string> = {}) =>
   spawnSync('/bin/bash', ['-c', `. "${VERSIONS}" && ${script}`], { encoding: 'utf8', timeout: 10_000, env: { ...process.env, ...env } });
 const tested = sh('printf %s "$GSTACK_BUN_TESTED"').stdout;
-const hint = (unameMs: string) => {
-  const r = sh(`gstack_bun_install_hint "${unameMs}"`);
+type Host = { avx2?: boolean; libc?: 'glibc' | 'musl' };
+/** The hint for UNAME_MS on a Linux host with these CPU flags and this libc. */
+const hint = (unameMs: string, { avx2 = true, libc = 'glibc' }: Host = {}) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-cpu-'));
+  bases.push(base);
+  const cpuinfo = path.join(base, 'cpuinfo');
+  fs.writeFileSync(cpuinfo, `processor\t: 0\nflags\t\t: fpu sse sse2 ${avx2 ? 'avx avx2 ' : ''}bmi1\n`);
+  const r = sh(`gstack_bun_install_hint "${unameMs}" "${cpuinfo}" ${libc}`);
   expect(r.status, r.stderr).toBe(0);
   return r.stdout;
+};
+/** Every 64-hex string in a hint must be the pin of the target it prints. */
+const expectOnlyPinOf = (text: string, target: string) => {
+  const pinned = sh(`gstack_bun_archive_sha256 ${target}`).stdout.trim();
+  expect(pinned).toMatch(/^[0-9a-f]{64}$/);
+  expect(text.match(/[0-9a-f]{64}/g)).toEqual([pinned]);
 };
 /** The indented recipe lines of a hint, as one script. */
 const recipe = (text: string) => text.split('\n').filter((l) => l.startsWith('  ')).map((l) => l.slice(2)).join('\n');
@@ -74,16 +88,46 @@ function bunZip(target: string): Buffer {
 const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex');
 
 describe('gstack_bun_install_hint', () => {
-  test('a pinned Linux target prints the pinned archive SHA-256 and a check that gates the install', () => {
-    for (const [uname, target] of [['Linux x86_64', 'linux-x64'], ['Linux aarch64', 'linux-aarch64'], ['Linux arm64', 'linux-aarch64']]) {
-      const pinned = sh(`gstack_bun_archive_sha256 ${target}`).stdout.trim();
-      expect(pinned).toMatch(/^[0-9a-f]{64}$/);
-      const text = hint(uname);
+  test('a pinned glibc Linux target prints the pin of that target and a check that gates the install', () => {
+    const cases: [string, Host, string][] = [
+      ['Linux x86_64', { avx2: true }, 'linux-x64'],
+      ['Linux x86_64', { avx2: false }, 'linux-x64-baseline'],
+      ['Linux aarch64', {}, 'linux-aarch64'],
+      ['Linux arm64', { avx2: false }, 'linux-aarch64'],
+    ];
+    for (const [uname, host, target] of cases) {
+      const text = hint(uname, host);
       expect(text).toContain(`BUN_VERSION="${tested}" target="${target}"`);
-      expect(text).toContain(`${pinned}  bun-$target.zip`);
-      expect(text).toMatch(/-c -\) \\\n {4}&& unzip/);
+      expectOnlyPinOf(text, target);
+      expect(text).toMatch(/[0-9a-f]{64} {2}bun-\$target\.zip" \| .+ -c -\) \\\n {4}&& unzip/);
       expect(text).not.toContain('SHASUMS256.txt"');
+      expect(text).not.toContain('AVX2');
     }
+  });
+
+  test('musl Linux selects the -musl archive and checks it against the release SHASUMS256.txt', () => {
+    const cases: [string, Host, string][] = [
+      ['Linux x86_64', { libc: 'musl', avx2: true }, 'linux-x64-musl'],
+      ['Linux x86_64', { libc: 'musl', avx2: false }, 'linux-x64-musl-baseline'],
+      ['Linux aarch64', { libc: 'musl' }, 'linux-aarch64-musl'],
+    ];
+    for (const [uname, host, target] of cases) {
+      const text = hint(uname, host);
+      expect(text).toContain(`BUN_VERSION="${tested}" target="${target}"`);
+      expect(text).toContain(`gstack pins no hash for ${target}`);
+      expect(text).toContain('curl -fsSL "$url/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt"');
+      expect(text).not.toMatch(/[0-9a-f]{64}/);
+    }
+  });
+
+  test('without a libc argument, an ldd that reports musl selects the -musl archive', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-bun-ldd-'));
+    bases.push(base);
+    fs.writeFileSync(path.join(base, 'ldd'), '#!/bin/sh\necho "musl libc (x86_64)" >&2\nexit 1\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(base, 'cpuinfo'), 'flags\t\t: avx2\n');
+    const r = sh(`gstack_bun_install_hint "Linux x86_64" "${base}/cpuinfo"`, { PATH: `${base}:${process.env.PATH}` });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain('target="linux-x64-musl"');
   });
 
   test('a target gstack pins no hash for is checked against the release SHASUMS256.txt, and says so', () => {
@@ -111,6 +155,14 @@ describe('gstack_bun_install_hint', () => {
     expect(r.urls).toContain(`/bun-v${tested}/bun-linux-x64.zip`);
     expect(r.out).toMatch(/FAILED|did NOT match/);
     expect(r.installed).toBe(false);
+  });
+
+  test.skipIf(!hasTools)('musl recipe: installs the -musl archive on a SHASUMS256.txt match', () => {
+    const zip = bunZip('linux-x64-musl-baseline');
+    const r = runRecipe(recipe(hint('Linux x86_64', { libc: 'musl', avx2: false })), zip, `${sha256(zip)}  bun-linux-x64-musl-baseline.zip\n`);
+    expect(r.urls).toContain(`/bun-v${tested}/bun-linux-x64-musl-baseline.zip`);
+    expect(r.out).toContain('bun-linux-x64-musl-baseline.zip: OK');
+    expect(r.installed).toBe(true);
   });
 
   test.skipIf(!hasTools)('SHASUMS256 recipe: installs on a match, refuses a mismatch and a missing row', () => {
