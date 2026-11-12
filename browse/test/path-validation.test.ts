@@ -231,10 +231,49 @@ describe('cookie redaction — production patterns', () => {
     expect(SENSITIVE_COOKIE_NAME.test('jwt.payload')).toBe(true);
   });
 
+  // Default session cookie names of common web frameworks. Each one carries a
+  // live session id, so `$B cookies` must never print its value.
+  it.each([
+    'PHPSESSID',                         // PHP
+    'JSESSIONID',                        // Java servlet containers (Tomcat, Jetty, Spring)
+    'JSESSIONIDSSO',                     // Tomcat single sign-on
+    'sessionid',                         // Django
+    '__Secure-sessionid',                // Django with a __Secure- prefix
+    'ASP.NET_SessionId',                 // ASP.NET
+    'ASPSESSIONIDQSDRATCB',              // classic ASP
+    'koa.sess',                          // Koa (koa-session)
+    'koa:sess',                          // Koa (older koa-session)
+    'SESS0123456789abcdef0123456789abcdef',  // Drupal (http)
+    'SSESS0123456789abcdef0123456789abcdef', // Drupal (https)
+    'wordpress_logged_in_0123456789abcdef',  // WordPress
+    'wordpress_sec_0123456789abcdef',        // WordPress
+    'CFID',                              // ColdFusion
+    'CFTOKEN',                           // ColdFusion
+    // Already matched before; kept here so the list stays complete.
+    'connect.sid',                       // Express (express-session)
+    '_session',
+    'laravel_session',                   // Laravel
+    '_myapp_session',                    // Rails
+    'ci_session',                        // CodeIgniter
+    'PLAY_SESSION',                      // Play
+    '__Secure-next-auth.session-token',  // NextAuth.js
+    '__Host-next-auth.csrf-token',       // NextAuth.js
+  ])('detects framework session cookie name %s', (name) => {
+    expect(SENSITIVE_COOKIE_NAME.test(name)).toBe(true);
+  });
+
   it('ignores non-sensitive cookie names', () => {
     expect(SENSITIVE_COOKIE_NAME.test('theme')).toBe(false);
     expect(SENSITIVE_COOKIE_NAME.test('locale')).toBe(false);
     expect(SENSITIVE_COOKIE_NAME.test('_ga')).toBe(false);
+  });
+
+  it.each([
+    '_gid', 'lang', 'currency', 'consent', 'cart_count', 'tz',
+    'sidebar_state', 'considered', 'keyboard_layout', 'visit_count',
+    'wordpress_test_cookie', 'cfg_layout', 'assessment_step', 'possession',
+  ])('keeps non-sensitive cookie name %s readable', (name) => {
+    expect(SENSITIVE_COOKIE_NAME.test(name)).toBe(false);
   });
 
   it('detects sensitive cookie value prefixes', () => {

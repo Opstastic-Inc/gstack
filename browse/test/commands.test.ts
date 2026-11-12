@@ -1424,6 +1424,21 @@ describe('Cookie command', () => {
     expect(cookies).toContain('testvalue');
   });
 
+  test('cookies redacts framework session cookies and keeps others readable', async () => {
+    await handleWriteCommand('goto', [baseUrl + '/basic.html'], bm);
+    await handleWriteCommand('cookie', ['PHPSESSID=php-session-value-1'], bm);
+    await handleWriteCommand('cookie', ['JSESSIONID=java-session-value-2'], bm);
+    await handleWriteCommand('cookie', ['sessionid=django-session-value-3'], bm);
+    await handleWriteCommand('cookie', ['ui_theme=dark-mode-value'], bm);
+
+    const cookies = JSON.parse(await handleReadCommand('cookies', [], bm));
+    const byName = new Map(cookies.map((c: { name: string; value: string }) => [c.name, c.value]));
+    expect(byName.get('PHPSESSID')).toBe('[REDACTED — 19 chars]');
+    expect(byName.get('JSESSIONID')).toBe('[REDACTED — 20 chars]');
+    expect(byName.get('sessionid')).toBe('[REDACTED — 22 chars]');
+    expect(byName.get('ui_theme')).toBe('dark-mode-value');
+  });
+
   test('cookie no arg throws', async () => {
     try {
       await handleWriteCommand('cookie', [], bm);

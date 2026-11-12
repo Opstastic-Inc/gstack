@@ -19,7 +19,12 @@ import { stripLoneSurrogates } from './sanitize';
 export { validateReadPath } from './path-security';
 
 // Redaction patterns for sensitive cookie/storage values — exported for test coverage
-export const SENSITIVE_COOKIE_NAME = /(^|[_.-])(token|secret|key|password|credential|auth|jwt|session|csrf|sid)($|[_.-])|api.?key/i;
+// The name pattern also covers framework session cookies whose names glue the
+// word to a prefix or suffix: PHPSESSID, JSESSIONID, sessionid (Django),
+// ASP.NET_SessionId, ASPSESSIONID* (classic ASP), koa.sess / koa:sess,
+// SESS<hash> / SSESS<hash> (Drupal), wordpress_logged_in_* / wordpress_sec_*,
+// and CFID / CFTOKEN (ColdFusion).
+export const SENSITIVE_COOKIE_NAME = /(^|[_.:-])(token|secret|key|password|credential|auth|jwt|session|sess|csrf|sid)($|[_.:-])|api.?key|sess(ion)?_?id|^s?sess[0-9a-f]{32}$|^wordpress_(logged_in|sec)_|^cf(id|token)$/i;
 export const SENSITIVE_COOKIE_VALUE = /^(eyJ|sk-|sk_live_|sk_test_|pk_live_|pk_test_|rk_live_|sk-ant-|ghp_|gho_|github_pat_|xox[bpsa]-|AKIA[A-Z0-9]{16}|AIza|SG\.|Bearer\s|sbp_)/;
 
 /** Detect await keyword, ignoring comments. Accepted risk: await in string literals triggers wrapping (harmless). */
