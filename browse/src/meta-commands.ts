@@ -251,6 +251,21 @@ export interface MetaCommandOpts {
   daemonPort?: number;
 }
 
+/**
+ * Read `newtab [url] [--json]`. --json, in any position, asks for structured
+ * output (make-pdf always passes it); the first other token is the url. The
+ * server's scope checks read the url through this too.
+ */
+export function parseNewtabArgs(args: string[]): { url?: string; jsonMode: boolean } {
+  let url: string | undefined;
+  let jsonMode = false;
+  for (const a of args) {
+    if (a === '--json') { jsonMode = true; }
+    else if (!url) { url = a; }
+  }
+  return { url, jsonMode };
+}
+
 export async function handleMetaCommand(
   command: string,
   args: string[],
@@ -278,14 +293,7 @@ export async function handleMetaCommand(
     }
 
     case 'newtab': {
-      // --json returns structured output (machine-parseable). Other flag-like
-      // tokens are treated as the url. make-pdf always passes --json.
-      let url: string | undefined;
-      let jsonMode = false;
-      for (const a of args) {
-        if (a === '--json') { jsonMode = true; }
-        else if (!url) { url = a; }
-      }
+      const { url, jsonMode } = parseNewtabArgs(args);
       const id = await bm.newTab(url);
       if (jsonMode) {
         return JSON.stringify({ tabId: id, url: url ?? null });

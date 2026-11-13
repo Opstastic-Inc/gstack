@@ -8,6 +8,7 @@
  *   validateOutputPath(path)   — for writing files (screenshot, pdf, download, scrape, archive)
  *   validateReadPath(path)     — for reading files (eval)
  *   validateTempPath(path)     — for serving files to remote agents (GET /file, TEMP_DIR only)
+ *   validateTempLocation(path) — for file: navigation by scoped tokens (TEMP_DIR only, may not exist)
  *
  * Security invariants:
  *   1. All paths resolved to absolute before checking
@@ -123,6 +124,20 @@ export function validateTempPath(filePath: string): void {
   const isSafe = TEMP_ONLY.some(dir => isPathWithin(realPath, dir));
   if (!isSafe) {
     throw new Error(`Path must be within: ${TEMP_ONLY.join(', ')} (remote file serving is restricted to temp directory)`);
+  }
+}
+
+/**
+ * Validate that a path resolves inside TEMP_DIR, for file: navigation by
+ * scoped tokens. The file need not exist: the refusal is the same for a path
+ * that exists and one that does not, and a missing file inside TEMP_DIR is
+ * left to the navigation, which reports it not found.
+ */
+export function validateTempLocation(filePath: string): void {
+  let realPath: string | undefined;
+  try { realPath = resolveRealPath(filePath); } catch { /* refused below */ }
+  if (!realPath || !TEMP_ONLY.some(dir => isPathWithin(realPath, dir))) {
+    throw new Error(`Path must be within: ${TEMP_ONLY.join(', ')}`);
   }
 }
 

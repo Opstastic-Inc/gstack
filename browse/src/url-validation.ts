@@ -6,7 +6,7 @@
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { validateReadPath } from './path-security';
+import { validateReadPath, validateTempLocation } from './path-security';
 
 /** Metadata services reached by name rather than address. */
 const BLOCKED_METADATA_HOSTNAMES = new Set([
@@ -215,6 +215,34 @@ export function normalizeFileUrl(url: string): string {
   return pathToFileURL(absPath).href + trailing;
 }
 
+export interface NavigationUrlOptions {
+  /**
+   * Which files a file: URL may open. 'safe-dirs' (default): the temp dirs and
+   * cwd, for the local CLI. 'temp-only': TEMP_DIR only, the rule GET /file
+   * applies, for scoped tokens (paired agents, skill spawns).
+   */
+  fileAccess?: 'safe-dirs' | 'temp-only';
+}
+
+/** Normalize non-standard file:// shapes, then parse. Throws on an invalid URL. */
+function parseNavigationUrl(url: string): URL {
+  const normalized = url.toLowerCase().startsWith('file:') ? normalizeFileUrl(url) : url;
+  try {
+    return new URL(normalized);
+  } catch {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+}
+
+/** True when validateNavigationUrl would treat `url` as a file: URL. */
+export function isFileNavigationUrl(url: string): boolean {
+  try {
+    return parseNavigationUrl(url).protocol === 'file:';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Validate a navigation URL and return a normalized version suitable for page.goto().
  *
@@ -226,20 +254,10 @@ export function normalizeFileUrl(url: string): string {
  *   - meta-commands.ts:diff (both URL args)
  *   - browser-manager.ts:newTab
  *   - browser-manager.ts:restoreState
+ *   - server.ts scope check: file: URLs of scoped tokens, with fileAccess 'temp-only'
  */
-export async function validateNavigationUrl(url: string): Promise<string> {
-  // Normalize non-standard file:// shapes before the URL parser sees them.
-  let normalized = url;
-  if (url.toLowerCase().startsWith('file:')) {
-    normalized = normalizeFileUrl(url);
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(normalized);
-  } catch {
-    throw new Error(`Invalid URL: ${url}`);
-  }
+export async function validateNavigationUrl(url: string, opts: NavigationUrlOptions = {}): Promise<string> {
+  const parsed = parseNavigationUrl(url);
 
   // file:// path: validate against safe-dirs and allow; otherwise defer to http(s) logic.
   if (parsed.protocol === 'file:') {
@@ -263,7 +281,8 @@ export async function validateNavigationUrl(url: string): Promise<string> {
     // Reject path traversal after decoding — e.g. file:///tmp/safe%2F..%2Fetc/passwd
     // Note: fileURLToPath doesn't collapse .., so a literal '..' in the decoded path
     // is suspicious. path.resolve will normalize it; check the result against safe dirs.
-    validateReadPath(fsPath);
+    if (opts.fileAccess === 'temp-only') validateTempLocation(fsPath);
+    else validateReadPath(fsPath);
 
     // Return the canonical file:// URL derived from the filesystem path + original
     // query + hash. This guarantees page.goto() gets a well-formed URL regardless

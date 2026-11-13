@@ -45,6 +45,20 @@ describe('validateNavigationUrl', () => {
     }
   });
 
+  // The refusal of a file under cwd is in scoped-file-navigation.test.ts, which
+  // runs with a cwd outside TEMP_DIR.
+  it("fileAccess 'temp-only' accepts a file under TEMP_DIR and leaves http alone", async () => {
+    const tmpHtml = path.join(TEMP_DIR, `browse-test-temp-only-${Date.now()}.html`);
+    fs.writeFileSync(tmpHtml, '<html><body>ok</body></html>');
+    try {
+      const result = await validateNavigationUrl(`file://${tmpHtml}`, { fileAccess: 'temp-only' });
+      expect(result.toLowerCase()).toContain('browse-test-temp-only-');
+    } finally {
+      fs.unlinkSync(tmpHtml);
+    }
+    await expect(validateNavigationUrl('http://example.com', { fileAccess: 'temp-only' })).resolves.toBe('http://example.com');
+  });
+
   it('rejects unsupported file URL host (UNC/network paths)', async () => {
     await expect(validateNavigationUrl('file://host.example.com/foo.html')).rejects.toThrow(/Unsupported file URL host/i);
   });
