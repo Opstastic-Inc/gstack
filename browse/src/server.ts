@@ -17,7 +17,7 @@ import { BrowserManager, markDaemonProcess } from './browser-manager';
 import { runInRequestTab } from './session-tabs';
 import { handleReadCommand, hasOutArg } from './read-commands';
 import { handleWriteCommand } from './write-commands';
-import { handleMetaCommand } from './meta-commands';
+import { handleMetaCommand, parseNewtabArgs } from './meta-commands';
 import { isFileNavigationUrl, validateNavigationUrl } from './url-validation';
 import { TEMP_DIR } from './platform';
 import { hasActivePicker } from './cookie-picker-routes';
@@ -1020,9 +1020,14 @@ async function handleCommandInternalImpl(
       };
     }
 
+    // The URLs a navigation command opens, read the way its handler reads them.
+    const navigationUrls = command === 'goto' ? args.slice(0, 1)
+      : command === 'newtab' ? [parseNewtabArgs(args).url ?? '']
+      : command === 'diff' ? args.slice(0, 2) : [];
+
     // Domain check for navigation commands
-    if ((command === 'goto' || command === 'newtab') && args[0]) {
-      if (!checkDomain(tokenInfo, args[0])) {
+    if ((command === 'goto' || command === 'newtab') && navigationUrls[0]) {
+      if (!checkDomain(tokenInfo, navigationUrls[0])) {
         return {
           status: 403, json: true,
           result: JSON.stringify({
@@ -1036,10 +1041,8 @@ async function handleCommandInternalImpl(
     // file: navigation is held to TEMP_DIR, the rule GET /file applies, so a
     // paired agent cannot open a project file (`goto file://./.env`, which the
     // local safe-dirs rule allows) and read it back with `text`.
-    const navigationUrls = command === 'goto' || command === 'newtab' ? args.slice(0, 1)
-      : command === 'diff' ? args.slice(0, 2) : [];
     for (const navigationUrl of navigationUrls) {
-      if (!isFileNavigationUrl(navigationUrl)) continue;
+      if (!navigationUrl || !isFileNavigationUrl(navigationUrl)) continue;
       try {
         await validateNavigationUrl(navigationUrl, { fileAccess: 'temp-only' });
       } catch (err: any) {
@@ -1097,7 +1100,7 @@ async function handleCommandInternalImpl(
 
   // ─── newtab with ownership for scoped tokens ──────────────
   if (command === 'newtab' && tokenInfo && tokenInfo.clientId !== 'root') {
-    const newId = await browserManager.newTab(args[0] || undefined, tokenInfo.clientId);
+    const newId = await browserManager.newTab(parseNewtabArgs(args).url, tokenInfo.clientId);
     return {
       status: 200, json: true,
       result: JSON.stringify({

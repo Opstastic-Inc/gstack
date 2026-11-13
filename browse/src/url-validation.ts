@@ -6,7 +6,7 @@
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { validateReadPath, validateTempPath } from './path-security';
+import { validateReadPath, validateTempLocation } from './path-security';
 
 /** Metadata services reached by name rather than address. */
 const BLOCKED_METADATA_HOSTNAMES = new Set([
@@ -281,7 +281,7 @@ export async function validateNavigationUrl(url: string, opts: NavigationUrlOpti
     // Reject path traversal after decoding — e.g. file:///tmp/safe%2F..%2Fetc/passwd
     // Note: fileURLToPath doesn't collapse .., so a literal '..' in the decoded path
     // is suspicious. path.resolve will normalize it; check the result against safe dirs.
-    if (opts.fileAccess === 'temp-only') validateTempPath(fsPath);
+    if (opts.fileAccess === 'temp-only') validateTempLocation(fsPath);
     else validateReadPath(fsPath);
 
     // Return the canonical file:// URL derived from the filesystem path + original

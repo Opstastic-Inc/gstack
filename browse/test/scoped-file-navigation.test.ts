@@ -34,8 +34,15 @@ import { validateNavigationUrl } from ${src('../src/url-validation.ts')};
 import { makeServer } from ${src('route-test-harness.ts')};
 
 const navigations = [];
+const fs = await import('node:fs');
+const { fileURLToPath } = await import('node:url');
 const page = {
-  goto: async (url) => { navigations.push(url); return { status: () => 200 }; },
+  // Chromium answers a missing file: URL with net::ERR_FILE_NOT_FOUND.
+  goto: async (url) => {
+    if (url.startsWith('file:') && !fs.existsSync(fileURLToPath(url))) throw new Error('page.goto: net::ERR_FILE_NOT_FOUND at ' + url);
+    navigations.push(url);
+    return { status: () => 200 };
+  },
   url: () => 'about:blank',
 };
 const session = { getPage: () => page, getActiveFrameOrPage: () => page, getFrame: () => null, clearLoadedHtml: () => {} };
@@ -76,8 +83,16 @@ for (const listener of ['tunnel', 'local']) {
   await run(listener + '-goto-rel', listener, scoped, { command: 'goto', args: ['file://./.env'] });
   await run(listener + '-goto-abs', listener, scoped, { command: 'goto', args: ['file://' + process.cwd() + '/.env'] });
   await run(listener + '-newtab', listener, scoped, { command: 'newtab', args: ['file://./.env'] });
+  await run(listener + '-newtab-json', listener, scoped, { command: 'newtab', args: ['--json', 'file://./.env'] });
+  await run(listener + '-goto-missing', listener, scoped, { command: 'goto', args: ['file://./missing.env'] });
   await run(listener + '-goto-temp', listener, scoped, { command: 'goto', args: ['file://' + ${JSON.stringify(tempFile)}] });
+  await run(listener + '-newtab-json-temp', listener, scoped, { command: 'newtab', args: ['--json', 'file://' + ${JSON.stringify(tempFile)}] });
+  await run(listener + '-goto-temp-missing', listener, scoped, { command: 'goto', args: ['file://' + ${JSON.stringify(tempFile)} + '.missing'] });
 }
+// diff is local-only (the tunnel refuses it by surface) and needs the meta scope; both URL positions are checked.
+const scopedMeta = server.scopedToken('meta-agent', ['read', 'write', 'meta']);
+await run('local-diff-first', 'local', scopedMeta, { command: 'diff', args: ['file://./.env', 'https://example.com'] });
+await run('local-diff-second', 'local', scopedMeta, { command: 'diff', args: ['https://example.com', 'file://./.env'] });
 await run('root-goto-rel', 'local', server.rootToken, { command: 'goto', args: ['file://./.env'] });
 server.cleanup();
 await Bun.write(${JSON.stringify(resultsFile)}, JSON.stringify({ unit, steps }));
@@ -113,18 +128,53 @@ describe('file: navigation for scoped tokens', () => {
 
   test('a scoped token cannot open a project file, over the tunnel or the local listener', () => {
     for (const listener of ['tunnel', 'local']) {
-      for (const name of ['goto-rel', 'goto-abs', 'newtab']) {
+      for (const name of ['goto-rel', 'goto-abs', 'newtab', 'newtab-json']) {
         const step = steps[`${listener}-${name}`];
-        expect(step.status).toBe(403);
-        expect(step.error).toMatch(/^Path must be within/);
-        expect(step.navigations).toEqual([]);
+        expect(step.status, name).toBe(403);
+        expect(step.error, name).toMatch(/^Path must be within/);
+        expect(step.navigations, name).toEqual([]);
       }
+    }
+  });
+
+  test('a scoped diff is refused a project file in either URL position', () => {
+    for (const name of ['local-diff-first', 'local-diff-second']) {
+      const step = steps[name];
+      expect(step.status, name).toBe(403);
+      expect(step.error, name).toMatch(/^Path must be within/);
+      expect(step.navigations, name).toEqual([]);
+    }
+  });
+
+  test('a scoped token gets the same refusal for a missing project file as for an existing one', () => {
+    for (const listener of ['tunnel', 'local']) {
+      const missing = steps[`${listener}-goto-missing`];
+      expect(missing.status).toBe(403);
+      expect(missing.error).toBe(steps[`${listener}-goto-rel`].error);
+      expect(missing.navigations).toEqual([]);
+    }
+  });
+
+  test('a missing file in the temp directory is not refused: the navigation reports it not found', () => {
+    for (const listener of ['tunnel', 'local']) {
+      const step = steps[`${listener}-goto-temp-missing`];
+      expect(step.status).not.toBe(403);
+      expect(step.error).toContain('ERR_FILE_NOT_FOUND');
     }
   });
 
   test('a scoped token can open a file in the temp directory', () => {
     for (const listener of ['tunnel', 'local']) {
       const step = steps[`${listener}-goto-temp`];
+      expect(step.status).toBe(200);
+      expect(step.navigations).toHaveLength(1);
+      expect(step.navigations[0]).toContain(path.basename(tempFile));
+    }
+  });
+
+  test('a scoped newtab --json opens the URL after the flag, as the newtab command reads it', () => {
+    for (const listener of ['tunnel', 'local']) {
+      const step = steps[`${listener}-newtab-json-temp`];
       expect(step.status).toBe(200);
       expect(step.navigations).toHaveLength(1);
       expect(step.navigations[0]).toContain(path.basename(tempFile));
